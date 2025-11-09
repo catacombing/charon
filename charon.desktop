@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Charon
+Exec=charon
+Comment=Maps & Navigation
+Icon=Charon
+Categories=Utility;Maps
+Keywords=mobile;wayland
