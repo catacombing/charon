@@ -8,16 +8,27 @@ license = "GPL-3.0"
 edition = "2024"
 rust-version = "1.88.0"
 
+[features]
+default = []
+profiling = ["dep:profiling", "dep:puffin_http"]
+
 [dependencies]
 calloop = "0.14.3"
 calloop-wayland-source = "0.4.1"
 configory = { version = "0.6.2", features = ["docgen", "log"] }
+dirs = "6.0.0"
 glutin = { version = "0.32.3", default-features = false, features = ["egl", "wayland"] }
+memmap2 = "0.9.9"
+profiling = { version = "1.0.17", optional = true, features = ["profile-with-puffin"] }
+puffin_http = { version = "0.16.1", optional = true }
 raw-window-handle = "0.6.2"
+reqwest = { version = "0.12.24", default-features = false, features = ["native-tls", "system-proxy", "http2"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 skia-safe = { version = "0.90.0", features = ["all-linux", "textlayout"] }
 smithay-client-toolkit = { version = "0.20.0", default-features = false, features = ["xkbcommon"] }
+tempfile = "3.23.0"
 thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "fs"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 wayland-backend = { version = "0.3.11", features = ["client_system"] }

@@ -5,41 +5,47 @@ pub mod window;
 use std::time::Instant;
 
 use crate::config::Input;
+use crate::geometry::Point;
 
-/// Scroll velocity state.
+/// Velocity state.
 #[derive(Default)]
-pub struct ScrollVelocity {
+pub struct Velocity {
     last_tick: Option<Instant>,
-    velocity: f64,
+    velocity: Point<f64>,
 }
 
-impl ScrollVelocity {
+impl Velocity {
     /// Check if there is any velocity active.
     pub fn is_moving(&self) -> bool {
-        self.velocity != 0.
+        self.velocity != Point::default()
     }
 
     /// Set the velocity.
-    pub fn set(&mut self, velocity: f64) {
+    pub fn set(&mut self, velocity: Point<f64>) {
         self.velocity = velocity;
         self.last_tick = None;
     }
 
-    /// Apply and update the current scroll velocity.
-    pub fn apply(&mut self, input: &Input, scroll_offset: &mut f64) {
+    /// Reset all velocity.
+    pub fn stop(&mut self) {
+        self.velocity = Point::default();
+    }
+
+    /// Apply and update the current velocity.
+    pub fn apply(&mut self, input: &Input) -> Option<Point<f64>> {
         // No-op without velocity.
-        if self.velocity == 0. {
-            return;
+        if self.velocity == Point::default() {
+            return None;
         }
 
         // Initialize velocity on the first tick.
         //
-        // This avoids applying velocity while the user is still actively scrolling.
+        // This avoids applying velocity while the user is still interacting.
         let last_tick = match self.last_tick.take() {
             Some(last_tick) => last_tick,
             None => {
                 self.last_tick = Some(Instant::now());
-                return;
+                return None;
             },
         };
 
@@ -48,16 +54,23 @@ impl ScrollVelocity {
         let interval =
             (now - last_tick).as_micros() as f64 / (input.velocity_interval as f64 * 1_000.);
 
-        // Apply and update velocity.
-        *scroll_offset += self.velocity * (1. - input.velocity_friction.powf(interval + 1.))
-            / (1. - input.velocity_friction);
-        self.velocity *= input.velocity_friction.powf(interval);
+        // Update velocity and calculate the expected delta.
+        let apply = |velocity: &mut f64| {
+            let delta = *velocity * (1. - input.velocity_friction.powf(interval + 1.))
+                / (1. - input.velocity_friction);
+            *velocity *= input.velocity_friction.powf(interval);
+            delta
+        };
+        let x = apply(&mut self.velocity.x);
+        let y = apply(&mut self.velocity.y);
 
         // Request next tick if velocity is significant.
-        if self.velocity.abs() > 1. {
+        if self.velocity.x.abs() > 1. || self.velocity.y.abs() > 1. {
             self.last_tick = Some(now);
         } else {
-            self.velocity = 0.
+            self.velocity = Point::default();
         }
+
+        Some(Point::new(x, y))
     }
 }

@@ -38,6 +38,7 @@ impl Renderer {
     }
 
     /// Perform drawing with this renderer mapped.
+    #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn draw<F: FnOnce(&SizedRenderer)>(&mut self, size: Size, fun: F) {
         let sized = self.sized(size);
         sized.make_current();

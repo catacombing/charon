@@ -33,12 +33,23 @@ This section documents the `[color]` table.
 |alt_foreground|Alternative foreground color|color|`"#bfbfbf"`|
 |alt_background|Alternative background color|color|`"#282828"`|
 
+### tiles
+
+This section documents the `[tiles]` table.
+
+|Name|Description|Type|Default|
+|-|-|-|-|
+|server|Raster tile server.<br><br>This should be your tile server's URI, using the variables `{x}` and `{y}` for the tile numbers and `{z}` for the zoom level.|text|`"https://tile.openstreetmap.org/{z}/{x}/{y}.png"`|
+|max_mem_tiles|Maximum number of map tiles cached in memory.<br><br>Tiles average ~100kB, which means 1_000 tiles will take around 100MB of RAM. A 720x1440p screen fits 18-28 tiles at a time.|integer|`1000`|
+|max_fs_tiles|Maximum number of map tiles cached on disk.<br><br>Tiles take on average ~20kB per tile, which means 50_000 tiles will take around 1GB of disk space.<br><br>Tiles are cached at `${XDG_CACHE_HOME:-$HOME/.cache}/charon/tiles/`.|integer|`50000`|
+|attribution|Tileserver attribution message|text|`"© OpenStreetMap"`|
+
 ### input
 
 This section documents the `[input]` table.
 
 |Name|Description|Type|Default|
 |-|-|-|-|
-|max_tap_distance|Square of the maximum distance before touch input is considered a drag|float|`400.0`|
 |velocity_interval|Milliseconds per velocity tick|integer|`30`|
 |velocity_friction|Percentage of velocity retained each tick|float|`0.85`|
+|max_tap_distance|Square of the maximum distance before touch input is considered a drag|float|`400.0`|

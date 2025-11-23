@@ -34,6 +34,8 @@ pub struct Config {
     pub font: Font,
     /// This section documents the `[color]` table.
     pub colors: Colors,
+    /// This section documents the `[tiles]` table.
+    pub tiles: Tiles,
     /// This section documents the `[input]` table.
     pub input: Input,
 }
@@ -45,7 +47,7 @@ pub struct Font {
     /// Font family.
     pub family: Arc<String>,
     /// Font size.
-    pub size: f64,
+    pub size: f32,
 }
 
 impl Default for Font {
@@ -89,17 +91,52 @@ impl Default for Colors {
     }
 }
 
+/// Map tile configuration.
+#[derive(Docgen, Deserialize, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct Tiles {
+    /// Raster tile server.
+    ///
+    /// This should be your tile server's URI, using the variables `{x}` and
+    /// `{y}` for the tile numbers and `{z}` for the zoom level.
+    pub server: Arc<String>,
+    /// Maximum number of map tiles cached in memory.
+    ///
+    /// Tiles average ~100kB, which means 1_000 tiles will take around 100MB of
+    /// RAM. A 720x1440p screen fits 18-28 tiles at a time.
+    pub max_mem_tiles: usize,
+    /// Maximum number of map tiles cached on disk.
+    ///
+    /// Tiles take on average ~20kB per tile, which means 50_000 tiles will take
+    /// around 1GB of disk space.
+    ///
+    /// Tiles are cached at `${XDG_CACHE_HOME:-$HOME/.cache}/charon/tiles/`.
+    pub max_fs_tiles: usize,
+    /// Tileserver attribution message.
+    pub attribution: Arc<String>,
+}
+
+impl Default for Tiles {
+    fn default() -> Self {
+        Self {
+            server: Arc::new(String::from("https://tile.openstreetmap.org/{z}/{x}/{y}.png")),
+            attribution: Arc::new(String::from("© OpenStreetMap")),
+            max_mem_tiles: 1_000,
+            max_fs_tiles: 50_000,
+        }
+    }
+}
+
 /// Input configuration.
 #[derive(Docgen, Deserialize, PartialEq, Copy, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct Input {
-    /// Square of the maximum distance before touch input is considered a drag.
-    pub max_tap_distance: f64,
-
     /// Milliseconds per velocity tick.
     pub velocity_interval: u16,
     /// Percentage of velocity retained each tick.
     pub velocity_friction: f64,
+    /// Square of the maximum distance before touch input is considered a drag.
+    pub max_tap_distance: f64,
 }
 
 impl Default for Input {

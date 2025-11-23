@@ -1,8 +1,11 @@
 //! Shared geometry types.
 
-use std::ops::{Mul, Sub, SubAssign};
+use std::f64::consts::PI;
+use std::ops::{Add, AddAssign, Div, Mul, Sub, SubAssign};
 
-use skia_safe::{Point as SkiaPoint, Rect};
+use skia_safe::Point as SkiaPoint;
+
+use crate::tiles::{TILE_SIZE, TileIndex};
 
 /// 2D object position.
 #[derive(PartialEq, Eq, Copy, Clone, Default, Debug)]
@@ -41,6 +44,23 @@ impl From<Point<f32>> for SkiaPoint {
     }
 }
 
+impl<T: Add<Output = T>> Add<Point<T>> for Point<T> {
+    type Output = Self;
+
+    fn add(mut self, other: Point<T>) -> Self {
+        self.x = self.x + other.x;
+        self.y = self.y + other.y;
+        self
+    }
+}
+
+impl<T: AddAssign> AddAssign<Point<T>> for Point<T> {
+    fn add_assign(&mut self, other: Point<T>) {
+        self.x += other.x;
+        self.y += other.y;
+    }
+}
+
 impl<T: Sub<Output = T>> Sub<Point<T>> for Point<T> {
     type Output = Self;
 
@@ -64,6 +84,16 @@ impl Mul<f64> for Point<f64> {
     fn mul(mut self, scale: f64) -> Self {
         self.x *= scale;
         self.y *= scale;
+        self
+    }
+}
+
+impl Div<f64> for Point<f64> {
+    type Output = Point<f64>;
+
+    fn div(mut self, scale: f64) -> Self {
+        self.x /= scale;
+        self.y /= scale;
         self
     }
 }
@@ -113,10 +143,55 @@ impl<T: Sub<Output = T>> Sub<Size<T>> for Size<T> {
     }
 }
 
-/// Check if a rectangle contains a point.
-pub fn rect_contains(rect: Rect, point: Point<f64>) -> bool {
-    point.x >= rect.left as f64
-        && point.y >= rect.top as f64
-        && point.x < rect.right as f64
-        && point.y < rect.bottom as f64
+/// Point in geographical space.
+pub struct GeoPoint {
+    pub long: f64,
+    pub lat: f64,
+}
+
+impl GeoPoint {
+    pub fn new(lat: f64, long: f64) -> Self {
+        Self { long, lat }
+    }
+
+    /// Convert this point to a position within a specific tile.
+    pub fn tile(&self, zoom: u8) -> (TileIndex, Point) {
+        let tile_count = (1 << zoom) as f64;
+
+        // Get the tile's X index and offset.
+        let x = tile_count * (self.long + 180.) / 360.;
+        let tile_x = x.floor() as u32;
+        let x_offset = (x.fract() * TILE_SIZE as f64).floor() as i32;
+
+        // Get the tile's Y index and offset.
+        let lat_rad = self.lat.to_radians();
+        let y = tile_count * (1. - (lat_rad.tan() + (1. / lat_rad.cos())).ln() / PI) / 2.;
+        let tile_y = y.floor() as u32;
+        let y_offset = (y.fract() * TILE_SIZE as f64).floor() as i32;
+
+        let index = TileIndex::new(tile_x, tile_y, zoom);
+        let offset = Point::new(x_offset, y_offset);
+
+        (index, offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn point_to_tile() {
+        let (tile, point) = GeoPoint::new(51.157800, 6.865500).tile(14);
+        assert_eq!(tile, TileIndex::new(8504, 5473, 14));
+        assert_eq!(point, Point::new(116, 144));
+
+        let (tile, point) = GeoPoint::new(51.16552, 6.8555).tile(14);
+        assert_eq!(tile, TileIndex::new(8504, 5473, 14));
+        assert_eq!(point, Point::new(0, 0));
+
+        let (tile, point) = GeoPoint::new(51.15867, 6.8665).tile(14);
+        assert_eq!(tile, TileIndex::new(8504, 5473, 14));
+        assert_eq!(point, Point::new(128, 128));
+    }
 }

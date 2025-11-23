@@ -227,10 +227,10 @@ impl TouchHandler for State {
         _serial: u32,
         _time: u32,
         _surface: WlSurface,
-        _id: i32,
+        slot: i32,
         position: (f64, f64),
     ) {
-        self.window.touch_down(position.into());
+        self.window.touch_down(slot, position.into());
     }
 
     fn motion(
@@ -239,10 +239,10 @@ impl TouchHandler for State {
         _queue: &QueueHandle<Self>,
         _touch: &WlTouch,
         _time: u32,
-        _id: i32,
+        slot: i32,
         position: (f64, f64),
     ) {
-        self.window.touch_motion(&self.config, position.into());
+        self.window.touch_motion(slot, position.into());
     }
 
     fn up(
@@ -252,9 +252,9 @@ impl TouchHandler for State {
         _touch: &WlTouch,
         _serial: u32,
         _time: u32,
-        _id: i32,
+        slot: i32,
     ) {
-        self.window.touch_up();
+        self.window.touch_up(slot);
     }
 
     fn cancel(&mut self, _connection: &Connection, _queue: &QueueHandle<Self>, _touch: &WlTouch) {}
@@ -294,11 +294,19 @@ impl PointerHandler for State {
             // Dispatch event to the window.
             match event.kind {
                 PointerEventKind::Press { button: BTN_LEFT, .. } => {
-                    self.window.touch_down(event.position.into());
+                    self.pointer_down = true;
+
+                    self.window.touch_down(-1, event.position.into());
+                },
+                PointerEventKind::Motion { .. } if self.pointer_down => {
+                    self.window.touch_motion(-1, event.position.into());
                 },
                 PointerEventKind::Release { button: BTN_LEFT, .. } => {
-                    self.window.touch_up();
+                    self.window.touch_up(-1);
+
+                    self.pointer_down = false;
                 },
+                PointerEventKind::Leave { .. } => self.pointer_down = false,
                 _ => (),
             }
         }

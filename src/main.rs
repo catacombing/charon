@@ -1,8 +1,13 @@
+use std::time::SystemTimeError;
 use std::{env, process};
 
 use calloop::{EventLoop, LoopHandle};
 use calloop_wayland_source::WaylandSource;
 use configory::{Manager as ConfigManager, Options as ConfigOptions};
+#[cfg(feature = "profiling")]
+use profiling::puffin;
+#[cfg(feature = "profiling")]
+use puffin_http::Server;
 use smithay_client_toolkit::reexports::client::globals::{
     self, BindError, GlobalError, GlobalList,
 };
@@ -20,6 +25,7 @@ use crate::wayland::ProtocolStates;
 
 mod config;
 mod geometry;
+mod tiles;
 mod ui;
 mod wayland;
 
@@ -28,11 +34,19 @@ mod gl {
     include!(concat!(env!("OUT_DIR"), "/gl_bindings.rs"));
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // Setup logging.
     let directives = env::var("RUST_LOG").unwrap_or("warn,charon=info,configory=info".into());
     let env_filter = EnvFilter::builder().parse_lossy(directives);
     FmtSubscriber::builder().with_env_filter(env_filter).with_line_number(true).init();
+
+    // Start profiling server.
+    #[cfg(feature = "profiling")]
+    let _server = {
+        puffin::set_scopes_on(true);
+        Server::new(&format!("0.0.0.0:{}", puffin_http::DEFAULT_PORT)).unwrap()
+    };
 
     info!("Started Charon");
 
@@ -68,9 +82,9 @@ struct State {
 
     pointer: Option<WlPointer>,
     touch: Option<WlTouch>,
+    pointer_down: bool,
 
     window: Window,
-    config: Config,
 
     terminated: bool,
 
@@ -98,13 +112,13 @@ impl State {
             .unwrap_or_default();
 
         // Create the Wayland window.
-        let window = Window::new(&protocol_states, connection, queue, &config)?;
+        let window = Window::new(event_loop, &protocol_states, connection, queue, &config)?;
 
         Ok(Self {
             protocol_states,
-            config,
             window,
             _config_manager: config_manager,
+            pointer_down: Default::default(),
             terminated: Default::default(),
             pointer: Default::default(),
             touch: Default::default(),
@@ -114,20 +128,33 @@ impl State {
 
 #[derive(thiserror::Error, Debug)]
 enum Error {
-    #[error("Wayland protocol error for {0}: {1}")]
-    WaylandProtocol(&'static str, #[source] BindError),
+    #[error("{0}")]
+    AtomicMove(#[from] tempfile::PersistError),
     #[error("{0}")]
     WaylandDispatch(#[from] DispatchError),
     #[error("{0}")]
     WaylandConnect(#[from] ConnectError),
     #[error("{0}")]
+    Glutin(#[from] glutin::error::Error),
+    #[error("{0}")]
+    SystemTime(#[from] SystemTimeError),
+    #[error("{0}")]
+    Configory(#[from] configory::Error),
+    #[error("{0}")]
     WaylandGlobal(#[from] GlobalError),
     #[error("{0}")]
     EventLoop(#[from] calloop::Error),
     #[error("{0}")]
-    Configory(#[from] configory::Error),
+    Request(#[from] reqwest::Error),
     #[error("{0}")]
-    Glutin(#[from] glutin::error::Error),
+    Io(#[from] std::io::Error),
+
+    #[error("Wayland protocol error for {0}: {1}")]
+    WaylandProtocol(&'static str, #[source] BindError),
+    #[error("URI {0:?} is not a valid image")]
+    InvalidImage(String),
+    #[error("Missing user cache directory")]
+    MissingCacheDir,
 }
 
 impl<T> From<calloop::InsertError<T>> for Error {

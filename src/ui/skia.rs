@@ -20,6 +20,7 @@ impl Canvas {
     /// Draw to the Skia canvas.
     ///
     /// This will return the underlying OpenGL texture ID.
+    #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn draw<F>(&mut self, gl_config: GlConfig, size: Size, f: F)
     where
         F: FnOnce(&SkiaCanvas),
