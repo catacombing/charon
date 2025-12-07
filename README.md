@@ -17,3 +17,9 @@ Charon is compiled with cargo, which creates a binary at `target/release/charon`
 ```sh
 cargo build --release
 ```
+
+To compile Charon, the following dependencies are required:
+ - boost (compile time)
+ - kyotocabinet (runtime)
+ - sqlite3 (runtime)
+ - marisa (runtime)

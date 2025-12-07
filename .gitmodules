@@ -1,0 +1,6 @@
+[submodule "geocoder-nlp-rs/geocoder-nlp"]
+	path = geocoder_nlp_rs/geocoder-nlp
+	url = https://github.com/chrisduerr/geocoder-nlp.git
+[submodule "geocoder_nlp_rs/libpostal"]
+	path = geocoder_nlp_rs/libpostal
+	url = https://github.com/openvenues/libpostal.git

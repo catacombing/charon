@@ -1,11 +1,20 @@
-pub mod renderer;
-pub mod skia;
-pub mod window;
-
 use std::time::Instant;
 
+use skia_safe::{Color4f, Paint, Rect};
+
 use crate::config::Input;
-use crate::geometry::Point;
+use crate::geometry::{Point, Size, rect_contains};
+use crate::ui::skia::{RenderState, Svg};
+pub use crate::ui::text_field::TextField;
+
+pub mod renderer;
+pub mod skia;
+mod text_field;
+pub mod view;
+pub mod window;
+
+/// Percentage of the button size reserved as padding.
+const BUTTON_PADDING: f64 = 0.1;
 
 /// Velocity state.
 #[derive(Default)]
@@ -72,5 +81,53 @@ impl Velocity {
         }
 
         Some(Point::new(x, y))
+    }
+}
+
+/// An SVG button.
+struct Button {
+    paint: Paint,
+    point: Point,
+    size: Size,
+    svg: Svg,
+}
+
+impl Button {
+    fn new(point: Point, size: Size, svg: Svg) -> Self {
+        let paint = Paint::default();
+        Self { paint, point, size, svg }
+    }
+
+    /// Render the button.
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn draw(&mut self, render_state: &mut RenderState, background: impl Into<Color4f>) {
+        self.paint.set_color4f(background.into(), None);
+
+        let right = self.point.x as f32 + self.size.width as f32;
+        let bottom = self.point.y as f32 + self.size.height as f32;
+        let rect = Rect::new(self.point.x as f32, self.point.y as f32, right, bottom);
+        render_state.draw_rect(rect, &self.paint);
+
+        let padding = self.size * BUTTON_PADDING;
+        let svg_size = self.size - Size::new(padding.width * 2, padding.height * 2);
+        let x = self.point.x + padding.width as i32;
+        let y = self.point.y + padding.height as i32;
+        render_state.draw_svg(self.svg, Point::new(x, y), svg_size);
+    }
+
+    /// Update the button's position.
+    pub fn set_point(&mut self, point: Point) {
+        self.point = point;
+    }
+
+    /// Update the button's size.
+    pub fn set_size(&mut self, size: Size) {
+        self.size = size;
+    }
+
+    /// Check if a point lies within this button.
+    pub fn contains(&self, point: Point<f64>) -> bool {
+        let point = Point::new(point.x.round() as i32, point.y.round() as i32);
+        rect_contains(self.point, self.size.into(), point)
     }
 }

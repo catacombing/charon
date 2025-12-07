@@ -1,7 +1,9 @@
 //! Configuration options.
 
 use std::fmt::{self, Display, Formatter};
+use std::ops::Deref;
 use std::sync::Arc;
+use std::time::Duration;
 
 use calloop::LoopHandle;
 use calloop::channel::{self, Event, Sender};
@@ -135,13 +137,22 @@ pub struct Input {
     pub velocity_interval: u16,
     /// Percentage of velocity retained each tick.
     pub velocity_friction: f64,
+
     /// Square of the maximum distance before touch input is considered a drag.
     pub max_tap_distance: f64,
+    /// Maximum interval between taps to be considered a double/trible-tap.
+    #[docgen(doc_type = "integer (milliseconds)", default = "300")]
+    pub max_multi_tap: MillisDuration,
 }
 
 impl Default for Input {
     fn default() -> Self {
-        Self { velocity_friction: 0.85, max_tap_distance: 400., velocity_interval: 30 }
+        Self {
+            max_multi_tap: Duration::from_millis(300).into(),
+            velocity_friction: 0.85,
+            max_tap_distance: 400.,
+            velocity_interval: 30,
+        }
     }
 }
 
@@ -237,6 +248,40 @@ impl Display for Color {
     }
 }
 
+/// Config wrapper for millisecond-precision durations.
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
+pub struct MillisDuration(Duration);
+
+impl Deref for MillisDuration {
+    type Target = Duration;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for MillisDuration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let ms = u64::deserialize(deserializer)?;
+        Ok(Duration::from_millis(ms).into())
+    }
+}
+
+impl From<Duration> for MillisDuration {
+    fn from(duration: Duration) -> Self {
+        Self(duration)
+    }
+}
+
+impl Display for MillisDuration {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+        write!(f, "{}", self.0.as_millis())
+    }
+}
+
 /// Event handler for configuration manager updates.
 pub struct ConfigEventHandler {
     tx: Sender<Config>,
@@ -249,7 +294,7 @@ impl ConfigEventHandler {
         let _ = event_loop
             .insert_source(rx, |event, _, state| {
                 if let Event::Msg(config) = event {
-                    state.window.update_config(&config);
+                    state.window.update_config(config);
                 }
             })
             .inspect_err(|err| error!("Failed to insert config source: {err}"));

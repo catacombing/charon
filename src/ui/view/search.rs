@@ -1,0 +1,772 @@
+//! Search UI view.
+
+use std::any::Any;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fmt::Write;
+use std::mem;
+use std::sync::Arc;
+
+use calloop::LoopHandle;
+use skia_safe::textlayout::TextAlign;
+use skia_safe::{Color4f, Paint, Rect};
+use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers};
+
+use crate::config::{Config, Input};
+use crate::geocoder::{Geocoder, Query, QueryResult};
+use crate::geometry::{GeoPoint, Point, Size};
+use crate::region::Regions;
+use crate::ui::skia::{RenderState, TextOptions};
+use crate::ui::view::{MapView, UiView, View};
+use crate::ui::{Button, Svg, TextField, Velocity};
+use crate::{Error, State};
+
+/// Padding around the screen edge at scale 1.
+const OUTSIDE_PADDING: u32 = 16;
+
+/// Back button width and height at scale 1.
+const BUTTON_SIZE: u32 = 48;
+
+/// Padding around the content of the search results at scale 1.
+const RESULTS_INSIDE_PADDING: f64 = 16.;
+
+/// Vertical space between search results at scale 1.
+const RESULTS_Y_PADDING: f64 = 2.;
+
+/// Region entry height at scale 1.
+const RESULTS_HEIGHT: u32 = 100;
+
+/// Padding between text inside the result entries at scale 1.
+const TEXT_PADDING: f64 = 3.;
+
+/// Search state text font size relative to the default.
+const SEARCH_STATE_FONT_SIZE: f32 = 1.2;
+
+/// Search result address text font size relative to the default.
+const ADDRESS_FONT_SIZE: f32 = 0.6;
+
+/// Search UI view.
+pub struct SearchView {
+    event_loop: LoopHandle<'static, State>,
+
+    geocoder: Geocoder,
+    last_query: String,
+    reference_point: GeoPoint,
+    reference_zoom: u8,
+
+    search_field: TextField,
+    config_button: Button,
+    search_button: Button,
+    back_button: Button,
+    bg_paint: Paint,
+
+    touch_state: TouchState,
+    input_config: Input,
+    scroll_offset: f64,
+
+    keyboard_focused: bool,
+    search_focused: bool,
+    ime_focused: bool,
+
+    size: Size,
+    scale: f64,
+
+    dirty: bool,
+}
+
+impl SearchView {
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    pub fn new(
+        event_loop: LoopHandle<'static, State>,
+        config: &Config,
+        regions: Arc<Regions>,
+        size: Size,
+    ) -> Result<Self, Error> {
+        let geocoder = Geocoder::new(event_loop.clone(), regions)?;
+
+        // Initialize UI elements.
+
+        let mut bg_paint = Paint::default();
+        bg_paint.set_color4f(Color4f::from(config.colors.background), None);
+
+        let point = Self::back_button_point(size, 1.);
+        let button_size = Self::button_size(1.);
+        let back_button = Button::new(point, button_size, Svg::ArrowLeft);
+
+        let point = Self::search_button_point(size, 1.);
+        let search_button = Button::new(point, button_size, Svg::Search);
+
+        let point = Self::config_button_point(size, 1.);
+        let config_button = Button::new(point, button_size, Svg::Config);
+
+        let search_size = Self::search_field_size(size, 1.);
+        let point = Self::search_field_point(size, 1.);
+        let mut search_field = TextField::new(event_loop.clone(), point, search_size, 1.);
+        search_field.set_placeholder("Search…");
+
+        Ok(Self {
+            config_button,
+            search_button,
+            search_field,
+            back_button,
+            event_loop,
+            bg_paint,
+            geocoder,
+            size,
+            input_config: config.input,
+            search_focused: true,
+            dirty: true,
+            scale: 1.,
+            keyboard_focused: Default::default(),
+            reference_point: Default::default(),
+            reference_zoom: Default::default(),
+            scroll_offset: Default::default(),
+            ime_focused: Default::default(),
+            touch_state: Default::default(),
+            last_query: Default::default(),
+        })
+    }
+
+    /// Get mutable access to the geocoder.
+    pub fn geocoder_mut(&mut self) -> &mut Geocoder {
+        &mut self.geocoder
+    }
+
+    /// Mark geocoding search results as dirty.
+    pub fn update_results(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Submit current search field text for geocoding.
+    pub fn submit_search(&mut self) {
+        self.last_query = self.search_field.text().to_owned();
+        self.dirty = true;
+
+        let mut query = Query::new(&self.last_query);
+        query.set_reference(self.reference_point, self.reference_zoom);
+        self.geocoder.query(query);
+    }
+
+    /// Update the search reference point.
+    pub fn set_reference(&mut self, point: GeoPoint, zoom: u8) {
+        self.reference_point = point;
+        self.reference_zoom = zoom;
+    }
+
+    /// Draw a search result entry.
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn draw_result<'a>(
+        &self,
+        config: &Config,
+        render_state: &mut RenderState<'a>,
+        point: Point,
+        size: Size,
+        result: &QueryResult,
+    ) {
+        let padding = (RESULTS_INSIDE_PADDING * self.scale).round() as f32;
+        let text_width = size.width as f32 - padding * 2.;
+        let mut text_point = point;
+        text_point.x += padding as i32;
+
+        // Draw background.
+        let bg_width = point.x as f32 + size.width as f32;
+        let bg_height = point.y as f32 + size.height as f32;
+        let bg_rect = Rect::new(point.x as f32, point.y as f32, bg_width, bg_height);
+        render_state.draw_rect(bg_rect, &self.bg_paint);
+
+        // Layout title and distance text.
+
+        let mut builder = render_state.paragraph(config.colors.foreground, 1., None);
+        builder.add_text(&result.title);
+
+        let mut title_paragraph = builder.build();
+        title_paragraph.layout(text_width);
+
+        // Layout entity type and distance text.
+
+        let options = TextOptions::new().ellipsize(true);
+        let mut builder =
+            render_state.paragraph(config.colors.foreground, ADDRESS_FONT_SIZE, options);
+        let entity_text = match result.distance {
+            Some(distance) => {
+                let mut text =
+                    String::with_capacity(result.entity_type.len() + " · XXXXX km".len());
+                let _ = write!(&mut text, "{} · ", result.entity_type);
+                format_distance(&mut text, distance);
+                Cow::Owned(text)
+            },
+            None => Cow::Borrowed(result.entity_type),
+        };
+        builder.add_text(entity_text);
+
+        let mut entity_paragraph = builder.build();
+        entity_paragraph.layout(text_width);
+
+        // Layout address text.
+
+        let options = TextOptions::new().ellipsize(false);
+        let mut builder =
+            render_state.paragraph(config.colors.alt_foreground, ADDRESS_FONT_SIZE, options);
+        let text = match &result.postal_code {
+            Some(postal_code) => Cow::Owned(format!("{}, {}", postal_code, result.address)),
+            None => Cow::Borrowed(result.address.as_str()),
+        };
+        builder.add_text(text);
+
+        let mut address_paragraph = builder.build();
+        address_paragraph.layout(text_width);
+
+        // Draw all labels.
+
+        let text_padding = (TEXT_PADDING * self.scale).round() as i32;
+        let title_text_height = title_paragraph.height().round() as i32;
+        let entity_text_height = entity_paragraph.height().round() as i32 + text_padding;
+        let address_text_height = address_paragraph.height().round() as i32 + text_padding;
+
+        text_point.y +=
+            (size.height as i32 - entity_text_height - title_text_height - address_text_height) / 2;
+
+        title_paragraph.paint(render_state, text_point);
+        text_point.y += title_text_height + text_padding;
+
+        entity_paragraph.paint(render_state, text_point);
+        text_point.y += entity_text_height + text_padding;
+
+        address_paragraph.paint(render_state, text_point);
+    }
+
+    /// Physical location of the search text field.
+    fn search_field_point(size: Size, scale: f64) -> Point {
+        let back_button_point = Self::back_button_point(size, scale);
+        let padding = (OUTSIDE_PADDING as f64 * scale).round() as i32;
+        let button_width = Self::button_size(scale).width as i32;
+
+        let x = back_button_point.x + button_width + padding;
+
+        Point::new(x, back_button_point.y)
+    }
+
+    /// Physical size of the search text field.
+    fn search_field_size(size: Size, scale: f64) -> Size {
+        let view_width = (size.width as f64 * scale).round() as u32;
+        let padding = (OUTSIDE_PADDING as f64 * scale).round() as u32;
+        let button_size = Self::button_size(scale);
+
+        let width = view_width - 2 * button_size.width - 4 * padding;
+
+        Size::new(width, button_size.height)
+    }
+
+    /// Physical location of the search button.
+    fn search_button_point(size: Size, scale: f64) -> Point {
+        let padding = (OUTSIDE_PADDING as f64 * scale).round() as i32;
+        let button_size = Self::button_size(scale);
+        let physical_size = size * scale;
+
+        let x = (physical_size.width - button_size.width) as i32 - padding;
+        let y = (physical_size.height - button_size.height) as i32 - padding;
+
+        Point::new(x, y)
+    }
+
+    /// Physical location of the back button.
+    fn back_button_point(size: Size, scale: f64) -> Point {
+        let padding = (OUTSIDE_PADDING as f64 * scale).round() as i32;
+        let button_size = Self::button_size(scale);
+        let physical_size = size * scale;
+
+        let y = (physical_size.height - button_size.height) as i32 - padding;
+
+        Point::new(padding, y)
+    }
+
+    /// Physical location of the config button.
+    fn config_button_point(size: Size, scale: f64) -> Point {
+        let padding = (OUTSIDE_PADDING as f64 * scale).round() as i32;
+        let button_size = Self::button_size(scale);
+        let physical_size = size * scale;
+
+        let x = (physical_size.width - button_size.width) as i32 - padding;
+        let y = (physical_size.height - button_size.height * 2) as i32 - padding * 2;
+
+        Point::new(x, y)
+    }
+
+    /// Physical size of the back/search buttons.
+    fn button_size(scale: f64) -> Size {
+        Size::new(BUTTON_SIZE, BUTTON_SIZE) * scale
+    }
+
+    /// Physical point of the bottommost search result entry.
+    fn result_point(&self) -> Point {
+        let back_button_point = Self::back_button_point(self.size, self.scale);
+        let outside_padding = (OUTSIDE_PADDING as f64 * self.scale).round() as i32;
+        let result_size = self.result_size();
+
+        let x = back_button_point.x;
+        let y = back_button_point.y - outside_padding - result_size.height as i32;
+
+        Point::new(x, y)
+    }
+
+    /// Physical size of a search result.
+    fn result_size(&self) -> Size {
+        let outside_padding = (OUTSIDE_PADDING as f64 * self.scale).round() as u32;
+        let size = self.size * self.scale;
+
+        let width = size.width - outside_padding * 2;
+        let height = (RESULTS_HEIGHT as f64 * self.scale).round() as u32;
+
+        Size::new(width, height)
+    }
+
+    /// Get result at the specified location.
+    fn result_at(&self, mut point: Point<f64>) -> Option<&QueryResult> {
+        let result_point = self.result_point();
+        let result_size = self.result_size();
+        let results_end = result_point.y as f64 + result_size.height as f64;
+
+        // Short-circuit if point is outside the results list.
+        if point.x < result_point.x as f64
+            || point.x >= result_point.x as f64 + result_size.width as f64
+            || point.y >= results_end
+        {
+            return None;
+        }
+
+        // Apply current scroll offset.
+        point.y -= self.scroll_offset;
+
+        // Ignore taps within vertical padding.
+        let results_height = result_size.height as f64 + RESULTS_Y_PADDING * self.scale;
+        let bottom_relative = results_end - point.y - 1.;
+        if bottom_relative % results_height >= result_size.height as f64 {
+            return None;
+        }
+
+        // Find index at the specified offset.
+        let results = self.geocoder.results();
+        let index = (bottom_relative / results_height).floor() as usize;
+
+        results.get(index)
+    }
+
+    /// Clamp viewport offset.
+    fn clamp_scroll_offset(&mut self) {
+        let old_offset = self.scroll_offset;
+        let max_offset = self.max_scroll_offset() as f64;
+        self.scroll_offset = self.scroll_offset.clamp(0., max_offset);
+
+        // Cancel velocity after reaching the scroll limit.
+        if old_offset != self.scroll_offset {
+            self.touch_state.velocity.stop();
+            self.dirty = true;
+        }
+    }
+
+    /// Get maximum viewport offset.
+    fn max_scroll_offset(&self) -> usize {
+        let outside_padding = (OUTSIDE_PADDING as f64 * self.scale).round() as usize;
+        let results_padding = (RESULTS_Y_PADDING * self.scale).round() as usize;
+        let result_height = self.result_size().height as usize;
+
+        // Calculate height of all results plus top padding.
+        let results_count = self.geocoder.results().len();
+        let results_height = (results_count * (result_height + results_padding))
+            .saturating_sub(results_padding)
+            + outside_padding;
+
+        // Calculate tab content outside the viewport.
+        results_height.saturating_sub(self.result_point().y as usize + result_height)
+    }
+}
+
+impl UiView for SearchView {
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn draw<'a>(&mut self, config: &Config, mut render_state: RenderState<'a>) {
+        let size = self.size * self.scale;
+
+        // Apply scroll velocity.
+        if let Some(delta) = self.touch_state.velocity.apply(&self.input_config) {
+            self.scroll_offset += delta.y;
+        }
+
+        // Ensure offset is correct in case size changed.
+        self.clamp_scroll_offset();
+
+        // Clear dirtiness flag.
+        //
+        // This is inentionally placed after functions like `clamp_scroll_offset`, since
+        // these modify dirtiness but do not require another redraw.
+        self.dirty = false;
+
+        // Ensure background paint is up to date.
+        self.bg_paint.set_color4f(Color4f::from(config.colors.alt_background), None);
+
+        render_state.clear(config.colors.background);
+
+        // Calculate results list geometry.
+
+        let padding = (RESULTS_Y_PADDING * self.scale).round() as i32;
+        let result_size = self.result_size();
+
+        let results_start = self.result_point();
+        let mut result_point = results_start;
+        result_point.y += self.scroll_offset.round() as i32;
+
+        // Set clipping mask to cut off results overlapping the bottom buttons.
+        let bottom = results_start.y as f32 + result_size.height as f32;
+        let clip_rect = Rect::new(0., 0., size.width as f32, bottom);
+        render_state.save();
+        render_state.clip_rect(clip_rect, None, Some(false));
+
+        // Draw query results.
+        let results = self.geocoder.results();
+        for result in results {
+            if result_point.y > results_start.y + (result_size.height as i32) {
+                result_point.y -= result_size.height as i32 + padding;
+                continue;
+            } else if result_point.y + (result_size.height as i32) < 0 {
+                break;
+            }
+
+            self.draw_result(config, &mut render_state, result_point, result_size, result);
+            result_point.y -= result_size.height as i32 + padding;
+        }
+
+        // Reset region clipping mask.
+        render_state.restore();
+
+        // Draw current search status indicator.
+        if results.is_empty() {
+            let msg = if self.geocoder.searching() {
+                Cow::Owned(format!("Searching for \"{}\" …", self.last_query))
+            } else {
+                Cow::Borrowed("No Results")
+            };
+
+            let options = TextOptions::new().ellipsize(false).align(TextAlign::Center);
+            let mut builder = render_state.paragraph(
+                config.colors.alt_foreground,
+                SEARCH_STATE_FONT_SIZE,
+                options,
+            );
+            builder.add_text(msg);
+
+            let mut paragraph = builder.build();
+            paragraph.layout(size.width as f32);
+
+            let result_end = results_start.y as f32 + result_size.height as f32;
+            let y = (result_end - paragraph.height()) / 2.;
+            paragraph.paint(&render_state, Point::new(0., y));
+        }
+
+        // Render search text field.
+        self.search_field.draw(config, &mut render_state, config.colors.alt_background);
+
+        // Render navigation button.
+        if results.is_empty() && !self.geocoder.searching() {
+            self.config_button.draw(&mut render_state, config.colors.alt_background);
+        }
+        self.search_button.draw(&mut render_state, config.colors.alt_background);
+        self.back_button.draw(&mut render_state, config.colors.alt_background);
+    }
+
+    fn dirty(&self) -> bool {
+        self.dirty || self.touch_state.velocity.is_moving() || self.search_field.dirty()
+    }
+
+    fn enter(&mut self) {
+        // Reset and refocus text field when the view is opened.
+        self.search_field.set_keyboard_focus(self.keyboard_focused);
+        self.search_field.set_ime_focus(self.ime_focused);
+        self.search_field.set_text("");
+        self.geocoder.clear_results();
+        self.search_focused = true;
+    }
+
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn set_size(&mut self, size: Size) {
+        self.size = size;
+        self.dirty = true;
+
+        // Update UI elements.
+
+        self.config_button.set_point(Self::config_button_point(size, self.scale));
+
+        self.search_button.set_point(Self::search_button_point(size, self.scale));
+
+        self.back_button.set_point(Self::back_button_point(size, self.scale));
+
+        self.search_field.set_point(Self::search_field_point(size, self.scale));
+        self.search_field.set_size(Self::search_field_size(size, self.scale));
+    }
+
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn set_scale_factor(&mut self, scale: f64) {
+        self.scale = scale;
+        self.dirty = true;
+
+        // Update UI elements.
+
+        self.config_button.set_point(Self::config_button_point(self.size, scale));
+        self.config_button.set_size(Self::button_size(scale));
+
+        self.search_button.set_point(Self::search_button_point(self.size, scale));
+        self.search_button.set_size(Self::button_size(scale));
+
+        self.back_button.set_point(Self::back_button_point(self.size, scale));
+        self.back_button.set_size(Self::button_size(scale));
+
+        self.search_field.set_point(Self::search_field_point(self.size, scale));
+        self.search_field.set_size(Self::search_field_size(self.size, scale));
+        self.search_field.set_scale_factor(scale);
+    }
+
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn touch_down(&mut self, slot: i32, time: u32, point: Point<f64>) {
+        // Cancel velocity if a new touch sequence starts.
+        self.touch_state.velocity.stop();
+
+        // Only allow a single active touch slot.
+        if !self.touch_state.slots.is_empty() {
+            return;
+        }
+
+        let point = point * self.scale;
+
+        // Handle focus changes for search field input.
+        self.search_focused = self.search_field.contains(point);
+        if self.search_focused {
+            self.search_field.set_keyboard_focus(self.keyboard_focused);
+            self.search_field.set_ime_focus(self.ime_focused);
+        } else {
+            self.search_field.set_keyboard_focus(false);
+            self.search_field.set_ime_focus(false);
+        }
+
+        // Determine goal of this touch sequence.
+        self.touch_state.action = if self.search_focused {
+            self.search_field.touch_down(&self.input_config, time, point);
+            TouchAction::SearchField
+        } else if self.config_button.contains(point) {
+            TouchAction::Config
+        } else if self.search_button.contains(point) {
+            TouchAction::Search
+        } else if self.back_button.contains(point) {
+            TouchAction::Back
+        } else {
+            TouchAction::Tap
+        };
+
+        // Convert position to physical space.
+        let slot = self.touch_state.slots.entry(slot).or_default();
+        slot.point = point;
+        slot.start = point;
+    }
+
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn touch_motion(&mut self, slot: i32, point: Point<f64>) {
+        // Ignore unknown touch slots.
+        let slot = match self.touch_state.slots.get_mut(&slot) {
+            Some(slot) => slot,
+            None => return,
+        };
+
+        // Update touch point.
+        let point = point * self.scale;
+        let old_point = mem::replace(&mut slot.point, point);
+
+        match self.touch_state.action {
+            // Handle action transitions.
+            TouchAction::Tap | TouchAction::Drag => {
+                // Ignore dragging until tap distance limit is exceeded.
+                let max_tap_distance = self.input_config.max_tap_distance;
+                let delta = slot.point - slot.start;
+                if delta.x.powi(2) + delta.y.powi(2) <= max_tap_distance {
+                    return;
+                }
+                self.touch_state.action = TouchAction::Drag;
+
+                // Update pending scroll velocity.
+                let delta = slot.point.y - old_point.y;
+                self.touch_state.velocity.set(Point::new(0., delta));
+
+                // Apply scroll motion.
+                let old_offset = self.scroll_offset;
+                self.scroll_offset += delta;
+                self.clamp_scroll_offset();
+                self.dirty |= self.scroll_offset != old_offset;
+            },
+            TouchAction::SearchField => self.search_field.touch_motion(&self.input_config, point),
+            _ => (),
+        }
+    }
+
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn touch_up(&mut self, slot: i32) {
+        // Reset touch slot, ignoring unknown slots.
+        let removed = match self.touch_state.slots.remove(&slot) {
+            Some(removed) => removed,
+            None => return,
+        };
+
+        // Dispatch tap actions on release.
+        match self.touch_state.action {
+            TouchAction::Tap => {
+                if let Some(&QueryResult { point, ref address, .. }) = self.result_at(removed.point)
+                {
+                    let zoom = zoom_from_address(address);
+                    self.event_loop.insert_idle(move |state| {
+                        let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
+                        map_view.goto(point, zoom);
+                        state.window.set_view(View::Map);
+                    });
+                }
+            },
+            TouchAction::Config if self.config_button.contains(removed.point) => {
+                self.event_loop.insert_idle(|state| state.window.set_view(View::Download));
+            },
+            TouchAction::Search if self.search_button.contains(removed.point) => {
+                self.submit_search()
+            },
+            TouchAction::Back if self.back_button.contains(removed.point) => {
+                self.event_loop.insert_idle(|state| state.window.set_view(View::Map));
+            },
+            TouchAction::SearchField => self.search_field.touch_up(),
+            _ => (),
+        }
+    }
+
+    fn keyboard_enter(&mut self) {
+        self.keyboard_focused = true;
+
+        if self.search_focused {
+            self.search_field.set_keyboard_focus(true);
+        }
+    }
+
+    fn keyboard_leave(&mut self) {
+        self.keyboard_focused = false;
+
+        // Always remove focus, since it's idempotent anyway.
+        self.search_field.set_keyboard_focus(false);
+    }
+
+    fn press_key(&mut self, _raw: u32, keysym: Keysym, modifiers: Modifiers) {
+        self.search_field.press_key(keysym, modifiers);
+    }
+
+    fn paste(&mut self, text: &str) {
+        self.search_field.paste(text);
+    }
+
+    fn text_input_enter(&mut self) {
+        self.ime_focused = true;
+
+        if self.search_focused {
+            self.search_field.set_ime_focus(true);
+        }
+    }
+
+    fn text_input_leave(&mut self) {
+        self.ime_focused = false;
+
+        // Always remove focus, since it's idempotent anyway.
+        self.search_field.set_ime_focus(false);
+    }
+
+    fn delete_surrounding_text(&mut self, before_length: u32, after_length: u32) {
+        self.search_field.delete_surrounding_text(before_length, after_length);
+    }
+
+    fn commit_string(&mut self, text: String) {
+        self.search_field.commit_string(&text);
+    }
+
+    fn set_preedit_string(&mut self, text: String, cursor_begin: i32, cursor_end: i32) {
+        self.search_field.set_preedit_string(text, cursor_begin, cursor_end);
+    }
+
+    fn take_text_input_dirty(&mut self) -> bool {
+        self.search_field.take_text_input_dirty()
+    }
+
+    fn text_input_enabled(&self) -> bool {
+        self.search_focused
+    }
+
+    fn surrounding_text(&self) -> (String, i32, i32) {
+        self.search_field.surrounding_text()
+    }
+
+    fn last_cursor_geometry(&self) -> Option<(Point, Size)> {
+        let rect = self.search_field.last_cursor_rect()?;
+        let point = Point::new(rect.left, rect.top).into();
+        let size = Size::new(rect.right - rect.left, rect.bottom - rect.top).into();
+        Some((point, size))
+    }
+
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn update_config(&mut self, config: &Config) {
+        if self.input_config != config.input {
+            self.input_config = config.input;
+            self.dirty = true;
+        }
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// Touch event tracking.
+#[derive(Default)]
+struct TouchState {
+    slots: HashMap<i32, TouchSlot>,
+    action: TouchAction,
+
+    velocity: Velocity,
+}
+
+/// Touch slot state.
+#[derive(Copy, Clone, Default, Debug)]
+struct TouchSlot {
+    start: Point<f64>,
+    point: Point<f64>,
+}
+
+/// Intention of a touch sequence.
+#[derive(PartialEq, Eq, Default)]
+enum TouchAction {
+    SearchField,
+    Search,
+    Config,
+    Back,
+    Drag,
+    #[default]
+    Tap,
+}
+
+/// Get zoom level necessary to make an address fully or mostly visible.
+fn zoom_from_address(address: &str) -> u8 {
+    match address.matches(',').count() {
+        0 => 6,
+        1 => 7,
+        2 | 3 => 11,
+        _ => 18,
+    }
+}
+
+/// Format a distance targeting 3 visible digits.
+fn format_distance(w: &mut impl Write, distance: u32) {
+    let (unit, divisor) = match distance {
+        ..1_000 => ("m", 1.),
+        _ => ("km", 1000.),
+    };
+
+    let distance = distance as f64 / divisor;
+    let precision = 2usize.saturating_sub(distance.log10() as usize);
+
+    let _ = write!(w, "{distance:.precision$} {unit}");
+}

@@ -56,15 +56,7 @@ pub struct Tiles {
 }
 
 impl Tiles {
-    pub fn new(tile_tx: Sender<TileIndex>, config: &Config) -> Result<Self, Error> {
-        // Create identifiable user agent, as required by OSM's tile usage policy.
-        let user_agent = format!(
-            "{}/{} (+https://catacombing.org; contact: charon@christianduerr.com)",
-            env!("CARGO_PKG_NAME"),
-            env!("CARGO_PKG_VERSION"),
-        );
-        let client = Client::builder().user_agent(user_agent).build()?;
-
+    pub fn new(client: Client, tile_tx: Sender<TileIndex>, config: &Config) -> Result<Self, Error> {
         // Initialize filesystem cache and remove outdated maps.
         let tile_dir = dirs::cache_dir().ok_or(Error::MissingCacheDir)?.join("charon/tiles");
         let server_tile_dir = Self::server_tile_dir(&tile_dir, config);

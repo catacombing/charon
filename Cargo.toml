@@ -5,29 +5,51 @@ description = "Wayland Mobile Maps & Navigation"
 authors = ["Christian Duerr <contact@christianduerr.com>"]
 repository = "https://github.com/catacombing/charon"
 license = "GPL-3.0"
+rust-version.workspace = true
+edition.workspace = true
+build = "src/build/mod.rs"
+
+[workspace]
+members = [
+    "geocoder_nlp_rs",
+]
+
+[workspace.package]
 edition = "2024"
 rust-version = "1.88.0"
+
+[workspace.dependencies]
+cc = "1.2.49"
+cxx = "1.0.190"
+cxx-build = "1.0.190"
+pkg-config = "0.3.32"
+thiserror = "2.0.17"
 
 [features]
 default = []
 profiling = ["dep:profiling", "dep:puffin_http"]
 
 [dependencies]
+bzip2 = "0.6.1"
 calloop = "0.14.3"
 calloop-wayland-source = "0.4.1"
 configory = { version = "0.6.2", features = ["docgen", "log"] }
 dirs = "6.0.0"
+geocoder_nlp = { version = "0.2.0", path = "./geocoder_nlp_rs" }
 glutin = { version = "0.32.3", default-features = false, features = ["egl", "wayland"] }
+indexmap = { version = "2.12.1", features = ["serde"] }
 memmap2 = "0.9.9"
 profiling = { version = "1.0.17", optional = true, features = ["profile-with-puffin"] }
 puffin_http = { version = "0.16.1", optional = true }
 raw-window-handle = "0.6.2"
 reqwest = { version = "0.12.24", default-features = false, features = ["native-tls", "system-proxy", "http2"] }
+resvg = { version = "0.45.1", default-features = false }
+serde_json = "1.0.145"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 skia-safe = { version = "0.90.0", features = ["all-linux", "textlayout"] }
 smithay-client-toolkit = { version = "0.20.0", default-features = false, features = ["xkbcommon"] }
 tempfile = "3.23.0"
-thiserror = "2.0.17"
+thiserror.workspace = true
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "fs"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
@@ -35,3 +57,6 @@ wayland-backend = { version = "0.3.11", features = ["client_system"] }
 
 [build-dependencies]
 gl_generator = "0.14.0"
+indexmap = { version = "2.12.1", features = ["serde"] }
+serde_json = "1.0.145"
+serde = { version = "1.0.228", features = ["derive", "rc"] }

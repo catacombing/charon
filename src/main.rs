@@ -1,30 +1,37 @@
-use std::time::SystemTimeError;
+use std::time::{Duration, SystemTimeError};
 use std::{env, process};
 
-use calloop::{EventLoop, LoopHandle};
+use calloop::timer::{TimeoutAction, Timer};
+use calloop::{EventLoop, LoopHandle, RegistrationToken};
 use calloop_wayland_source::WaylandSource;
 use configory::{Manager as ConfigManager, Options as ConfigOptions};
 #[cfg(feature = "profiling")]
 use profiling::puffin;
 #[cfg(feature = "profiling")]
 use puffin_http::Server;
+use smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource;
 use smithay_client_toolkit::reexports::client::globals::{
     self, BindError, GlobalError, GlobalList,
 };
+use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::WlKeyboard;
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
 use smithay_client_toolkit::reexports::client::protocol::wl_touch::WlTouch;
 use smithay_client_toolkit::reexports::client::{
     ConnectError, Connection, DispatchError, QueueHandle,
 };
+use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers, RepeatInfo};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 use crate::config::{Config, ConfigEventHandler};
 use crate::ui::window::Window;
-use crate::wayland::ProtocolStates;
+use crate::wayland::{ProtocolStates, TextInput};
 
 mod config;
+mod entity_type;
+mod geocoder;
 mod geometry;
+mod region;
 mod tiles;
 mod ui;
 mod wayland;
@@ -62,7 +69,7 @@ fn run() -> Result<(), Error> {
     let (globals, queue) = globals::registry_queue_init(&connection)?;
 
     let mut event_loop = EventLoop::try_new()?;
-    let mut state = State::new(&event_loop.handle(), connection.clone(), &globals, queue.handle())?;
+    let mut state = State::new(event_loop.handle(), connection.clone(), &globals, queue.handle())?;
 
     // Insert wayland source into calloop loop.
     let wayland_source = WaylandSource::new(connection, queue);
@@ -78,9 +85,13 @@ fn run() -> Result<(), Error> {
 
 /// Application state.
 struct State {
+    event_loop: LoopHandle<'static, Self>,
     protocol_states: ProtocolStates,
 
+    keyboard: Option<KeyboardState>,
+    text_input: Vec<TextInput>,
     pointer: Option<WlPointer>,
+    clipboard: ClipboardState,
     touch: Option<WlTouch>,
     pointer_down: bool,
 
@@ -93,7 +104,7 @@ struct State {
 
 impl State {
     fn new(
-        event_loop: &LoopHandle<'static, Self>,
+        event_loop: LoopHandle<'static, Self>,
         connection: Connection,
         globals: &GlobalList,
         queue: QueueHandle<Self>,
@@ -102,7 +113,7 @@ impl State {
 
         // Initialize configuration state.
         let config_options = ConfigOptions::new("charon").notify(true);
-        let config_handler = ConfigEventHandler::new(event_loop);
+        let config_handler = ConfigEventHandler::new(&event_loop);
         let config_manager = ConfigManager::with_options(&config_options, config_handler)?;
         let config = config_manager
             .get::<&str, Config>(&[])
@@ -112,17 +123,150 @@ impl State {
             .unwrap_or_default();
 
         // Create the Wayland window.
-        let window = Window::new(event_loop, &protocol_states, connection, queue, &config)?;
+        let window = Window::new(&event_loop, &protocol_states, connection, queue, config)?;
 
         Ok(Self {
             protocol_states,
+            event_loop,
             window,
             _config_manager: config_manager,
             pointer_down: Default::default(),
             terminated: Default::default(),
+            text_input: Default::default(),
+            clipboard: Default::default(),
+            keyboard: Default::default(),
             pointer: Default::default(),
             touch: Default::default(),
         })
+    }
+}
+
+/// Key status tracking for WlKeyboard.
+pub struct KeyboardState {
+    wl_keyboard: WlKeyboard,
+    repeat_info: RepeatInfo,
+    modifiers: Modifiers,
+
+    current_repeat: Option<CurrentRepeat>,
+}
+
+impl Drop for KeyboardState {
+    fn drop(&mut self) {
+        self.wl_keyboard.release();
+    }
+}
+
+impl KeyboardState {
+    pub fn new(wl_keyboard: WlKeyboard) -> Self {
+        Self {
+            wl_keyboard,
+            repeat_info: RepeatInfo::Disable,
+            current_repeat: Default::default(),
+            modifiers: Default::default(),
+        }
+    }
+
+    /// Handle new key press.
+    fn press_key(
+        &mut self,
+        event_loop: &LoopHandle<'static, State>,
+        time: u32,
+        raw: u32,
+        keysym: Keysym,
+    ) {
+        // Update key repeat timers.
+        if !keysym.is_modifier_key() {
+            self.request_repeat(event_loop, time, raw, keysym);
+        }
+    }
+
+    /// Handle new key release.
+    fn release_key(&mut self, event_loop: &LoopHandle<'static, State>, raw: u32) {
+        // Cancel repetition if released key is being repeated.
+        if self.current_repeat.as_ref().is_some_and(|repeat| repeat.raw == raw) {
+            self.cancel_repeat(event_loop);
+        }
+    }
+
+    /// Stage new key repetition.
+    fn request_repeat(
+        &mut self,
+        event_loop: &LoopHandle<'static, State>,
+        time: u32,
+        raw: u32,
+        keysym: Keysym,
+    ) {
+        // Ensure all previous events are cleared.
+        self.cancel_repeat(event_loop);
+
+        let (delay_ms, rate) = match self.repeat_info {
+            RepeatInfo::Repeat { delay, rate } => (delay, rate),
+            _ => return,
+        };
+
+        // Stage timer for initial delay.
+        let delay = Duration::from_millis(delay_ms as u64);
+        let interval = Duration::from_millis(1000 / rate.get() as u64);
+        let timer = Timer::from_duration(delay);
+        let repeat_source = event_loop.insert_source(timer, move |_, _, state| {
+            let keyboard = match state.keyboard.as_mut() {
+                Some(keyboard) => keyboard,
+                None => return TimeoutAction::Drop,
+            };
+
+            state.window.press_key(raw, keysym, keyboard.modifiers);
+
+            TimeoutAction::ToDuration(interval)
+        });
+
+        match repeat_source {
+            Ok(repeat_source) => {
+                self.current_repeat = Some(CurrentRepeat::new(repeat_source, raw, time, delay_ms));
+            },
+            Err(err) => error!("Failed to stage key repeat timer: {err}"),
+        }
+    }
+
+    /// Cancel currently staged key repetition.
+    fn cancel_repeat(&mut self, event_loop: &LoopHandle<'static, State>) {
+        if let Some(CurrentRepeat { repeat_source, .. }) = self.current_repeat.take() {
+            event_loop.remove(repeat_source);
+        }
+    }
+}
+
+/// Active keyboard repeat state.
+pub struct CurrentRepeat {
+    repeat_source: RegistrationToken,
+    interval: u32,
+    time: u32,
+    raw: u32,
+}
+
+impl CurrentRepeat {
+    pub fn new(repeat_source: RegistrationToken, raw: u32, time: u32, interval: u32) -> Self {
+        Self { repeat_source, time, interval, raw }
+    }
+
+    /// Get the next key event timestamp.
+    pub fn next_time(&mut self) -> u32 {
+        self.time += self.interval;
+        self.time
+    }
+}
+
+/// Clipboard content cache.
+#[derive(Default)]
+struct ClipboardState {
+    serial: u32,
+    text: String,
+    source: Option<CopyPasteSource>,
+}
+
+impl ClipboardState {
+    fn next_serial(&mut self) -> u32 {
+        self.serial += 1;
+        self.serial
     }
 }
 
@@ -130,6 +274,8 @@ impl State {
 enum Error {
     #[error("{0}")]
     AtomicMove(#[from] tempfile::PersistError),
+    #[error("{0}")]
+    TokioJoin(#[from] tokio::task::JoinError),
     #[error("{0}")]
     WaylandDispatch(#[from] DispatchError),
     #[error("{0}")]
@@ -147,6 +293,8 @@ enum Error {
     #[error("{0}")]
     Request(#[from] reqwest::Error),
     #[error("{0}")]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
     Io(#[from] std::io::Error),
 
     #[error("Wayland protocol error for {0}: {1}")]
@@ -155,6 +303,8 @@ enum Error {
     InvalidImage(String),
     #[error("Missing user cache directory")]
     MissingCacheDir,
+    #[error("Unexpected root path")]
+    UnexpectedRoot,
 }
 
 impl<T> From<calloop::InsertError<T>> for Error {
