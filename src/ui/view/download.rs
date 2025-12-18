@@ -182,7 +182,7 @@ impl DownloadView {
         match region.regions.len() {
             0 => (),
             1 => size_text.push_str(" · 1 Region"),
-            count => _ = write!(&mut size_text, " · {} Regions", count),
+            count => _ = write!(&mut size_text, " · {count} Regions"),
         }
 
         let mut builder = render_state.paragraph(config.colors.alt_foreground, ALT_FONT_SIZE, None);
