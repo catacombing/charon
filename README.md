@@ -10,6 +10,13 @@
 
 <br />
 
+## Screenshots
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/54264b0d-1ae4-40cc-a8b4-68885e8d0984" width="30%"/>
+  <img src="https://github.com/user-attachments/assets/e81b74fe-bb86-40b8-bdbc-a5d75f38c7d5" width="30%"/>
+</p>
+
 ## Building from Source
 
 Charon is compiled with cargo, which creates a binary at `target/release/charon`:
