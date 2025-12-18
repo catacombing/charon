@@ -22,6 +22,8 @@ jobs:
             libpango1.0-dev \
             libpulse-dev
       - uses: actions/checkout@v2
+        with:
+          submodules: 'recursive'
       - name: Stable
         run: cargo test
       - name: Stable no-features
