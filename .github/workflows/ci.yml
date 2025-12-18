@@ -13,7 +13,14 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install libgtk-4-dev libpango1.0-dev libasound2-dev libpulse-dev
+          sudo apt-get install \
+            libasound2-dev \
+            libboost-dev \
+            libgtk-4-dev \
+            libkyotocabinet-dev \
+            libmarisa-dev sqlite3 \
+            libpango1.0-dev \
+            libpulse-dev
       - uses: actions/checkout@v2
       - name: Stable
         run: cargo test
