@@ -5,6 +5,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::prelude::*;
 use calloop::LoopHandle;
 use calloop::channel::{self, Event, Sender};
 use configory::EventHandler;
@@ -101,6 +102,9 @@ pub struct Tiles {
     ///
     /// This should be your tile server's URI, using the variables `{x}` and
     /// `{y}` for the tile numbers and `{z}` for the zoom level.
+    #[docgen(
+        default = "https://tile.jawg.io/c09eed68-abaf-45b9-bed8-8bb2076013d7/{z}/{x}/{y}.png"
+    )]
     pub server: Arc<String>,
     /// Maximum number of map tiles cached in memory.
     ///
@@ -120,9 +124,15 @@ pub struct Tiles {
 
 impl Default for Tiles {
     fn default() -> Self {
+        // Avoid exposting jawg token to crawlers.
+        let url = "https://tile.jawg.io/c09eed68-abaf-45b9-bed8-8bb2076013d7/{z}/{x}/{y}.png";
+        let token_bytes = BASE64_STANDARD.decode("P2FjY2Vzcy10b2tlbj1Ydk94aTMxakNtYlRBSDRUcW1zM3RXb\
+            EJsUTNBQ1o5cWxTY0NnSkFzVkVLRUNMYk16S3BJeTdRaGtJU1NiWmNs").unwrap();
+        let token = str::from_utf8(&token_bytes).unwrap();
+
         Self {
-            server: Arc::new(String::from("https://tile.openstreetmap.org/{z}/{x}/{y}.png")),
-            attribution: Arc::new(String::from("© OpenStreetMap")),
+            server: Arc::new(format!("{url}{token}")),
+            attribution: Arc::new(String::from("© JawgMaps © OpenStreetMap")),
             max_mem_tiles: 1_000,
             max_fs_tiles: 50_000,
         }

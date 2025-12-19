@@ -8,7 +8,7 @@ use std::sync::Arc;
 use calloop::LoopHandle;
 use calloop::channel::{self, Event};
 use reqwest::Client;
-use skia_safe::{FilterMode, MipmapMode, Paint, Rect, SamplingOptions};
+use skia_safe::{Color4f, FilterMode, MipmapMode, Paint, Rect, SamplingOptions};
 
 use crate::config::{Config, Input};
 use crate::geometry::{GeoPoint, Point, Size};
@@ -24,6 +24,9 @@ const SEARCH_BUTTON_SIZE: u32 = 48;
 
 /// Padding around the search button at scale 1.
 const SEARCH_BUTTON_PADDING: u32 = 16;
+
+/// Border around the search button at scale 1.
+const SEARCH_BUTTON_BORDER: f64 = 1.;
 
 /// Attribution label font size relative to the default.
 const ATTRIBUTION_FONT_SIZE: f32 = 0.5;
@@ -86,11 +89,15 @@ impl MapView {
         let size = Self::search_button_size(1.);
         let search_button = Button::new(point, size, Svg::Search);
 
+        let mut tile_paint = Paint::default();
+        tile_paint.set_color4f(Color4f::from(config.colors.background), None);
+
         Ok(Self {
             cursor_offset,
             search_button,
             cursor_tile,
             event_loop,
+            tile_paint,
             regions,
             tiles,
             size,
@@ -100,7 +107,6 @@ impl MapView {
             pending_tiles: Default::default(),
             cursor_zoom: Default::default(),
             touch_state: Default::default(),
-            tile_paint: Default::default(),
         })
     }
 
@@ -353,7 +359,21 @@ impl UiView for MapView {
             paragraph.paint(&render_state, Point::new(0., 0.));
         }
 
-        // Render UI elements.
+        // Draw search button with a border to distinguish it from the map.
+
+        let search_point: Point<f32> = Self::search_button_point(self.size, self.scale).into();
+        let search_size: Size<f32> = Self::search_button_size(self.scale).into();
+        let search_border = (SEARCH_BUTTON_BORDER * self.scale) as f32;
+
+        let search_left = search_point.x - search_border;
+        let search_top = search_point.y - search_border;
+        let search_right = search_point.x + search_size.width + search_border;
+        let search_bottom = search_point.y + search_size.height + search_border;
+        let border_rect = Rect::new(search_left, search_top, search_right, search_bottom);
+
+        self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
+        render_state.draw_rect(border_rect, &self.tile_paint);
+
         self.search_button.draw(&mut render_state, config.colors.alt_background);
 
         // If no downloads are pending, pre-download tiles just outside the viewport.

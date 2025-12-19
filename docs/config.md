@@ -39,10 +39,10 @@ This section documents the `[tiles]` table.
 
 |Name|Description|Type|Default|
 |-|-|-|-|
-|server|Raster tile server.<br><br>This should be your tile server's URI, using the variables `{x}` and `{y}` for the tile numbers and `{z}` for the zoom level.|text|`"https://tile.openstreetmap.org/{z}/{x}/{y}.png"`|
+|server|Raster tile server.<br><br>This should be your tile server's URI, using the variables `{x}` and `{y}` for the tile numbers and `{z}` for the zoom level.|text|`https://tile.jawg.io/c09eed68-abaf-45b9-bed8-8bb2076013d7/{z}/{x}/{y}.png`|
 |max_mem_tiles|Maximum number of map tiles cached in memory.<br><br>Tiles average ~100kB, which means 1_000 tiles will take around 100MB of RAM. A 720x1440p screen fits 18-28 tiles at a time.|integer|`1000`|
 |max_fs_tiles|Maximum number of map tiles cached on disk.<br><br>Tiles take on average ~20kB per tile, which means 50_000 tiles will take around 1GB of disk space.<br><br>Tiles are cached at `${XDG_CACHE_HOME:-$HOME/.cache}/charon/tiles/`.|integer|`50000`|
-|attribution|Tileserver attribution message|text|`"© OpenStreetMap"`|
+|attribution|Tileserver attribution message|text|`"© JawgMaps © OpenStreetMap"`|
 
 ### input
 
