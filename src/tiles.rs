@@ -1,23 +1,22 @@
 //! Map tile handling.
 
 use std::collections::{HashMap, LinkedList};
-use std::fs::File;
-use std::io::ErrorKind as IoErrorKind;
 use std::iter;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use calloop::channel::Sender;
-use memmap2::Mmap;
 use reqwest::Client;
 use skia_safe::{Data, Image};
-use tempfile::NamedTempFile;
+use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqliteJournalMode, SqliteRow, SqliteSynchronous};
+use sqlx::{FromRow, Pool, Row};
 use tokio::runtime::Handle as RuntimeHandle;
+use tokio::sync::SetOnce;
 use tokio::task::{self, JoinHandle};
-use tokio::{fs as tokio_fs, time};
-use tracing::{debug, error};
+use tokio::time;
+use tracing::{error, warn};
 
 use crate::Error;
 use crate::config::Config;
@@ -29,18 +28,18 @@ pub const TILE_SIZE: i32 = 256;
 /// Maximum tile zoom level.
 pub const MAX_ZOOM: u8 = 19;
 
-/// How frequently old filesystem entries are vacated from the cache.
+/// How frequently old tiles are deleted from the database.
 ///
-/// The total number of memory used by the filesystem cache will always be
-/// between `MAX_FS_CACHED_TILES` and `MAX_FS_CACHED_TILES` +
+/// The total number of tiles in the database will always be between
+/// `config.tiles.max_fs_tiles` and `config.tiles.max_fs_tiles` +
 /// `FS_CACHE_CLEANUP_INTERVAL`.
 ///
-/// A higher cleanup interval means less frequent filesystem traversal to find
-/// tiles which should be vacated.
-const FS_CACHE_CLEANUP_INTERVAL: u16 = 500;
+/// A higher cleanup interval means less frequent database queries to remove old
+/// entries.
+const FS_CACHE_CLEANUP_INTERVAL: u16 = 1_000;
 
-/// Maximum age for tiles cached on the filesystem.
-const MAX_FS_CACHE_TIME: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+/// Maximum db tile age in seconds before an online refresh is attempted.
+const MAX_FS_CACHE_TIME: u64 = 60 * 60 * 24 * 7;
 
 /// Time before a failed download will be re-attempted.
 const FAILED_DOWNLOAD_DELAY: Duration = Duration::from_secs(3);
@@ -52,22 +51,21 @@ const FAILED_DOWNLOAD_DELAY: Duration = Duration::from_secs(3);
 pub struct Tiles {
     download_state: DownloadState,
     lru_cache: LruCache,
-    tile_dir: PathBuf,
 }
 
 impl Tiles {
     pub fn new(client: Client, tile_tx: Sender<TileIndex>, config: &Config) -> Result<Self, Error> {
         // Initialize filesystem cache and remove outdated maps.
-        let tile_dir = dirs::cache_dir().ok_or(Error::MissingCacheDir)?.join("charon/tiles");
-        let server_tile_dir = Self::server_tile_dir(&tile_dir, config);
-        let fs_cache = Arc::new(FsCache::new(server_tile_dir, config.tiles.max_fs_tiles));
+        let tile_path =
+            dirs::cache_dir().ok_or(Error::MissingCacheDir)?.join("charon/tiles.sqlite");
+        let fs_cache = FsCache::new(config, tile_path);
         let cleanup_cache = fs_cache.clone();
         tokio::spawn(async move { cleanup_cache.clean_cache().await });
 
         let download_state =
             DownloadState { fs_cache, tile_tx, client, server: config.tiles.server.clone() };
 
-        Ok(Self { download_state, tile_dir, lru_cache: LruCache::new(config.tiles.max_mem_tiles) })
+        Ok(Self { download_state, lru_cache: LruCache::new(config.tiles.max_mem_tiles) })
     }
 
     /// Get a raster map tile.
@@ -84,8 +82,8 @@ impl Tiles {
     /// Ensure a map tile is downloaded.
     #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn preload(&mut self, index: TileIndex) {
-        // Ignore tile if it is already cached in memory or FS.
-        if self.lru_cache.has_tile(&index) || self.download_state.fs_cache.has_tile(index) {
+        // Ignore tile if it is already cached.
+        if self.lru_cache.has_tile(&index) {
             return;
         }
 
@@ -98,9 +96,7 @@ impl Tiles {
         let mut dirty = false;
 
         if self.download_state.server != config.tiles.server {
-            let server_tile_dir = Self::server_tile_dir(&self.tile_dir, config);
-            Arc::make_mut(&mut self.download_state.fs_cache).dir = server_tile_dir;
-
+            self.download_state.fs_cache.set_tileserver(config.tiles.server.clone());
             self.download_state.server = config.tiles.server.clone();
             self.lru_cache.clear();
             dirty = true;
@@ -109,16 +105,10 @@ impl Tiles {
             self.lru_cache.capacity = config.tiles.max_mem_tiles;
         }
         if self.download_state.fs_cache.capacity != config.tiles.max_fs_tiles {
-            let fs_cache = Arc::make_mut(&mut self.download_state.fs_cache);
-            fs_cache.capacity = config.tiles.max_fs_tiles;
+            self.download_state.fs_cache.capacity = config.tiles.max_fs_tiles;
         }
 
         dirty
-    }
-
-    /// Get tileserver-specific tile dir from the general-purpose tile dir path.
-    fn server_tile_dir(tile_dir: &Path, config: &Config) -> PathBuf {
-        tile_dir.join(config.tiles.server.replace('/', "_"))
     }
 }
 
@@ -241,8 +231,8 @@ pub struct Tile {
 
 impl Drop for Tile {
     fn drop(&mut self) {
-        // Abort download if the tile leaves the cache before finishing.
-        if let PendingImage::Downloading(Some(task)) = &self.image {
+        // Abort loading if the tile leaves the cache before finishing.
+        if let PendingImage::Loading(Some(task)) = &self.image {
             task.abort();
         }
     }
@@ -252,25 +242,30 @@ impl Tile {
     /// Load a new tile.
     #[cfg_attr(feature = "profiling", profiling::function)]
     fn new(download_state: DownloadState, index: TileIndex) -> Self {
-        // Try to load file from filesystem cache first.
-        match download_state.fs_cache.get(index) {
-            Ok(Some(data)) => match Image::from_encoded(Data::new_copy(&data)) {
-                Some(image) => {
-                    return Self { download_state, index, image: PendingImage::Done(image) };
-                },
-                None => {
-                    let path = download_state.fs_cache.tile_path(index);
-                    error!("Invalid cached tile: {path:?}");
-                },
-            },
-            Ok(None) => (),
-            Err(err) => error!("Failed to load tile {index:?} from cache: {err}"),
-        }
-
-        // If it's not in the filesystem cache, start a new download.
+        // Spawn background task to load image from cache or network.
         let task_download_state = download_state.clone();
-        let download_task = tokio::spawn(Self::download(task_download_state, index));
-        let image = PendingImage::Downloading(Some(download_task));
+        let load_task = tokio::spawn(async move {
+            // Try to load the tile from the filesystem DB.
+            let db_tile = match task_download_state.fs_cache.get(index).await {
+                // Immediately return DB image if it is not outdated.
+                Ok(Some(db_tile)) if db_tile.age_secs <= MAX_FS_CACHE_TIME => {
+                    // Notify renderer about new map load completion.
+                    let _ = task_download_state.tile_tx.send(index);
+
+                    return Ok(db_tile.image);
+                },
+                // Use DB image as download fallback if it is outdated.
+                Ok(db_tile) => db_tile,
+                Err(err) => {
+                    error!("Failed to load tile {index:?} from cache: {err}");
+                    None
+                },
+            };
+
+            // If it's not in the filesystem cache, start a new download.
+            Self::download(&task_download_state, index, db_tile).await
+        });
+        let image = PendingImage::Loading(Some(load_task));
 
         Self { download_state, index, image }
     }
@@ -278,8 +273,8 @@ impl Tile {
     /// Get the tile's image.
     #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn image(&mut self) -> Option<&Image> {
-        // Process asynchronous downloads once finished.
-        if let PendingImage::Downloading(task) = &mut self.image
+        // Process asynchronous loads once finished.
+        if let PendingImage::Loading(task) = &mut self.image
             && task.as_ref().is_some_and(|task| task.is_finished())
         {
             let image =
@@ -287,6 +282,7 @@ impl Tile {
 
             match image {
                 Ok(Ok(image)) => self.image = PendingImage::Done(image),
+                // Handle errors for download failures, DB errors are never propagated.
                 Ok(Err(err)) => {
                     error!("Image download failed: {err}");
 
@@ -295,9 +291,9 @@ impl Tile {
                     let index = self.index;
                     let download_task = tokio::spawn(async move {
                         time::sleep(FAILED_DOWNLOAD_DELAY).await;
-                        Self::download(download_state, index).await
+                        Self::download(&download_state, index, None).await
                     });
-                    self.image = PendingImage::Downloading(Some(download_task));
+                    self.image = PendingImage::Loading(Some(download_task));
                 },
                 Err(err) => error!("Failed to join image future: {err}"),
             }
@@ -310,15 +306,36 @@ impl Tile {
     }
 
     /// Load a new tile from the tileserver.
-    async fn download(state: DownloadState, index: TileIndex) -> Result<Image, Error> {
+    async fn download(
+        state: &DownloadState,
+        index: TileIndex,
+        db_tile: Option<DbTile>,
+    ) -> Result<Image, Error> {
         // Get image from tileserver.
         let uri = state
             .server
             .replace("{x}", &index.x.to_string())
             .replace("{y}", &index.y.to_string())
             .replace("{z}", &index.z.to_string());
-        let response = state.client.get(&uri).send().await?.error_for_status()?;
-        let data = response.bytes().await?;
+        let send_request = async || {
+            let response = state.client.get(&uri).send().await?.error_for_status()?;
+            Ok::<_, Error>(response.bytes().await?)
+        };
+        let data = send_request().await;
+
+        // Get request data, or fallback to DB tile if present and request failed.
+        let data = match (data, db_tile) {
+            (Ok(data), _) => data,
+            (Err(err), Some(db_tile)) => {
+                warn!("Download failed, using cached tile: {err}");
+
+                // Notify renderer about new map download completion.
+                let _ = state.tile_tx.send(index);
+
+                return Ok(db_tile.image);
+            },
+            (Err(err), None) => return Err(err),
+        };
 
         // Add tile to filesystem cache.
         state.fs_cache.insert(index, &data).await?;
@@ -350,7 +367,7 @@ impl TileIndex {
 
 /// Asynchronous image download state.
 enum PendingImage {
-    Downloading(Option<JoinHandle<Result<Image, Error>>>),
+    Loading(Option<JoinHandle<Result<Image, Error>>>),
     Done(Image),
 }
 
@@ -406,110 +423,153 @@ impl LruCache {
 }
 
 /// A filesystem cach for tiles.
-#[derive(Default)]
 struct FsCache {
-    dir: PathBuf,
-    capacity: usize,
-    last_cleanup: AtomicU16,
+    pool: Arc<SetOnce<Pool<Sqlite>>>,
+    last_cleanup: Arc<AtomicU16>,
+    tileserver: Arc<String>,
+    capacity: u32,
 }
 
 impl FsCache {
-    fn new(dir: PathBuf, capacity: usize) -> Self {
-        Self { last_cleanup: AtomicU16::new(0), capacity, dir }
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn new(config: &Config, path: PathBuf) -> Self {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .create_if_missing(true);
+
+        // Initialize DB connection in the background.
+        let pool = Arc::new(SetOnce::new());
+        let future_pool = pool.clone();
+        tokio::spawn(async move {
+            if let Err(err) = Self::init_pool(options, future_pool).await {
+                error!("Failed to initialize filesystem cache: {err}");
+            }
+        });
+
+        Self {
+            pool,
+            last_cleanup: Arc::new(AtomicU16::new(0)),
+            tileserver: config.tiles.server.clone(),
+            capacity: config.tiles.max_fs_tiles,
+        }
     }
 
     /// Add a new tile to the cache.
     async fn insert(&self, index: TileIndex, data: &[u8]) -> Result<(), Error> {
-        let path = self.tile_path(index);
-
-        // Atomically write image data to the file.
-        tokio_fs::create_dir_all(&self.dir).await?;
-        let file = NamedTempFile::new_in(&self.dir)?;
-        tokio_fs::write(&file, data).await?;
-        file.persist(path)?;
+        #[rustfmt::skip]
+        sqlx::query(
+            "INSERT INTO tile (tileserver, x, y, z, data) \
+                VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT DO UPDATE \
+                SET data=excluded.data",
+        )
+        .bind(&*self.tileserver)
+        .bind(index.x)
+        .bind(index.y)
+        .bind(index.z)
+        .bind(data)
+        .execute(self.pool.wait().await)
+        .await?;
 
         // Cleanup cache every `FS_CACHE_CLEANUP_INTERVAL` inserts.
         if self.last_cleanup.fetch_add(1, Ordering::Relaxed) >= FS_CACHE_CLEANUP_INTERVAL {
             self.last_cleanup.store(0, Ordering::Relaxed);
 
             // Report cache errors immediately, to avoid failing the download.
-            self.clean_cache().await;
+            if let Err(err) = self.clean_cache().await {
+                error!("Failed tile DB cleanup: {err}");
+            }
         }
 
         Ok(())
     }
 
     /// Read a tile from the cache.
-    #[cfg_attr(feature = "profiling", profiling::function)]
-    fn get(&self, index: TileIndex) -> Result<Option<Mmap>, Error> {
-        let path = self.tile_path(index);
-
-        // Try to open the file, returning `None` if the tile is not cached.
-        let file = match File::open(path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == IoErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
-
-        let data = unsafe { Mmap::map(&file)? };
-
-        Ok(Some(data))
-    }
-
-    /// Check if a tile exists in the FS cache.
-    fn has_tile(&self, index: TileIndex) -> bool {
-        let path = self.tile_path(index);
-        path.exists()
+    async fn get(&self, index: TileIndex) -> Result<Option<DbTile>, Error> {
+        #[rustfmt::skip]
+        let data = sqlx::query_as(
+            "UPDATE tile SET atime = unixepoch() \
+                WHERE tileserver = ? AND x = ? AND y = ? and z = ? \
+             RETURNING unixepoch() - ctime as age_secs, data",
+        )
+        .bind(&*self.tileserver)
+        .bind(index.x)
+        .bind(index.y)
+        .bind(index.z)
+        .fetch_optional(self.pool.wait().await)
+        .await?;
+        Ok(data)
     }
 
     /// Perform filesystem cache cleanup.
-    async fn clean_cache(&self) {
-        let mut read_dir = match tokio_fs::read_dir(&self.dir).await {
-            Ok(read_dir) => read_dir,
-            Err(err) if err.kind() == IoErrorKind::NotFound => return,
-            Err(err) => {
-                error!("Cache directory access failed: {err}");
-                return;
-            },
-        };
+    async fn clean_cache(&self) -> Result<(), Error> {
+        let pool = self.pool.wait().await;
 
-        // Get all stored tiles, ordered by creation time.
-        let mut cached_files = Vec::new();
-        while let Ok(Some(entry)) = read_dir.next_entry().await {
-            if let Ok(metadata) = entry.metadata().await
-                && let Ok(created) = metadata.created()
-                && let Ok(elapsed) = created.elapsed()
-            {
-                cached_files.push((entry.path(), elapsed));
-            }
-        }
-        cached_files.sort_unstable_by_key(|(_, time)| *time);
+        // Delete least recently used tiles beyond the tile capacity.
+        sqlx::query(
+            "DELETE FROM tile WHERE id NOT IN (SELECT id FROM tile ORDER BY atime DESC LIMIT ?)",
+        )
+        .bind(self.capacity)
+        .execute(pool)
+        .await?;
 
-        // Delete all files beyond capacity or `MAX_FS_CACHE_TIME`.
-        for (i, (path, created)) in cached_files.into_iter().enumerate().rev() {
-            if i >= self.capacity || created > MAX_FS_CACHE_TIME {
-                let _ = tokio_fs::remove_file(&path).await;
-                debug!("Removed {path:?} from cache");
-            } else {
-                break;
-            }
-        }
+        // Defragment and truncate database file.
+        sqlx::query("VACUUM").execute(pool).await?;
+
+        Ok(())
     }
 
-    /// Get the cache path for a tile.
-    fn tile_path(&self, index: TileIndex) -> PathBuf {
-        let file_name = format!("{}_{}_{}.png", index.z, index.x, index.y);
-        self.dir.join(&file_name)
+    /// Asynchronously initialize the database pool.
+    async fn init_pool(
+        options: SqliteConnectOptions,
+        setter: Arc<SetOnce<Pool<Sqlite>>>,
+    ) -> Result<(), Error> {
+        let pool = Pool::connect_with(options).await?;
+
+        // Run database migrations.
+        sqlx::migrate!("./migrations").run(&pool).await?;
+
+        let _ = setter.set(pool);
+
+        Ok(())
+    }
+
+    /// Update the tileserver URL.
+    fn set_tileserver(&mut self, tileserver: Arc<String>) {
+        self.tileserver = tileserver;
     }
 }
 
 impl Clone for FsCache {
     fn clone(&self) -> Self {
+        let last_cleanup = self.last_cleanup.load(Ordering::Relaxed);
+
         Self {
-            last_cleanup: AtomicU16::new(self.last_cleanup.load(Ordering::Relaxed)),
+            last_cleanup: Arc::new(AtomicU16::new(last_cleanup)),
+            tileserver: self.tileserver.clone(),
             capacity: self.capacity,
-            dir: self.dir.clone(),
+            pool: self.pool.clone(),
         }
+    }
+}
+
+/// Tile data retrieved from the database.
+struct DbTile {
+    age_secs: u64,
+    image: Image,
+}
+
+impl FromRow<'_, SqliteRow> for DbTile {
+    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
+        let data: Vec<u8> = row.try_get("data")?;
+        let age_secs = row.try_get("age_secs")?;
+
+        let image = Image::from_encoded(Data::new_copy(&data))
+            .ok_or_else(|| sqlx::Error::Decode("Invalid cached tile {index:?}".into()))?;
+
+        Ok(Self { age_secs, image })
     }
 }
 
@@ -520,8 +580,8 @@ impl Clone for FsCache {
 #[derive(Clone)]
 struct DownloadState {
     tile_tx: Sender<TileIndex>,
-    fs_cache: Arc<FsCache>,
     server: Arc<String>,
+    fs_cache: FsCache,
     client: Client,
 }
 

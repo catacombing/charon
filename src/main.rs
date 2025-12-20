@@ -273,6 +273,8 @@ impl ClipboardState {
 #[derive(thiserror::Error, Debug)]
 enum Error {
     #[error("{0}")]
+    SqlMigrate(#[from] sqlx::migrate::MigrateError),
+    #[error("{0}")]
     AtomicMove(#[from] tempfile::PersistError),
     #[error("{0}")]
     TokioJoin(#[from] tokio::task::JoinError),
@@ -296,10 +298,12 @@ enum Error {
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Sql(#[from] sqlx::Error),
 
     #[error("Wayland protocol error for {0}: {1}")]
     WaylandProtocol(&'static str, #[source] BindError),
-    #[error("URI {0:?} is not a valid image")]
+    #[error("URL {0:?} is not a valid image")]
     InvalidImage(String),
     #[error("Missing user cache directory")]
     MissingCacheDir,

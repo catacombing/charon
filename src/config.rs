@@ -117,7 +117,7 @@ pub struct Tiles {
     /// around 1GB of disk space.
     ///
     /// Tiles are cached at `${XDG_CACHE_HOME:-$HOME/.cache}/charon/tiles/`.
-    pub max_fs_tiles: usize,
+    pub max_fs_tiles: u32,
     /// Tileserver attribution message.
     pub attribution: Arc<String>,
 }
