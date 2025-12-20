@@ -110,6 +110,11 @@ impl MapView {
         })
     }
 
+    /// Access the tile storage.
+    pub fn tiles(&self) -> &Tiles {
+        &self.tiles
+    }
+
     /// Get the geographic location an the center of the screen.
     pub fn geographic_point(&self) -> GeoPoint {
         GeoPoint::from_tile(self.cursor_tile, self.cursor_offset)

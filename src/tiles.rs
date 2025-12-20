@@ -110,6 +110,11 @@ impl Tiles {
 
         dirty
     }
+
+    /// Access the underlying SQLite tiles DB.
+    pub fn fs_cache(&self) -> &FsCache {
+        &self.download_state.fs_cache
+    }
 }
 
 /// Iterator over positioned tiles.
@@ -423,7 +428,7 @@ impl LruCache {
 }
 
 /// A filesystem cach for tiles.
-struct FsCache {
+pub struct FsCache {
     pool: Arc<SetOnce<Pool<Sqlite>>>,
     last_cleanup: Arc<AtomicU16>,
     tileserver: Arc<String>,
@@ -454,6 +459,11 @@ impl FsCache {
             tileserver: config.tiles.server.clone(),
             capacity: config.tiles.max_fs_tiles,
         }
+    }
+
+    /// Close the SQLite database connection.
+    pub async fn close(&self) {
+        self.pool.wait().await.close().await;
     }
 
     /// Add a new tile to the cache.

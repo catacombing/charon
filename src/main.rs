@@ -20,6 +20,8 @@ use smithay_client_toolkit::reexports::client::{
     ConnectError, Connection, DispatchError, QueueHandle,
 };
 use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers, RepeatInfo};
+use crate::ui::view::map::MapView;
+use crate::ui::view::View;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
@@ -57,13 +59,13 @@ async fn main() {
 
     info!("Started Charon");
 
-    if let Err(err) = run() {
+    if let Err(err) = run().await {
         error!("[CRITICAL] {err}");
         process::exit(1);
     }
 }
 
-fn run() -> Result<(), Error> {
+async fn run() -> Result<(), Error> {
     // Initialize Wayland connection.
     let connection = Connection::connect_to_env()?;
     let (globals, queue) = globals::registry_queue_init(&connection)?;
@@ -79,6 +81,10 @@ fn run() -> Result<(), Error> {
     while !state.terminated {
         event_loop.dispatch(None, &mut state)?;
     }
+
+    // Ensure database is cleanly terminated.
+    let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
+    map_view.tiles().fs_cache().close().await;
 
     Ok(())
 }
