@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, LinkedList};
 use std::iter;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -56,9 +56,8 @@ pub struct Tiles {
 impl Tiles {
     pub fn new(client: Client, tile_tx: Sender<TileIndex>, config: &Config) -> Result<Self, Error> {
         // Initialize filesystem cache and remove outdated maps.
-        let tile_path =
-            dirs::cache_dir().ok_or(Error::MissingCacheDir)?.join("charon/tiles.sqlite");
-        let fs_cache = FsCache::new(config, tile_path);
+        let tiles_path = Self::tiles_path()?;
+        let fs_cache = FsCache::new(config, tiles_path);
         let cleanup_cache = fs_cache.clone();
         tokio::spawn(async move { cleanup_cache.clean_cache().await });
 
@@ -114,6 +113,11 @@ impl Tiles {
     /// Access the underlying SQLite tiles DB.
     pub fn fs_cache(&self) -> &FsCache {
         &self.download_state.fs_cache
+    }
+
+    /// Get the storage path for the tiles sqlite DB.
+    pub fn tiles_path() -> Result<PathBuf, Error> {
+        Ok(dirs::cache_dir().ok_or(Error::MissingCacheDir)?.join("charon/tiles.sqlite"))
     }
 }
 
@@ -437,7 +441,7 @@ pub struct FsCache {
 
 impl FsCache {
     #[cfg_attr(feature = "profiling", profiling::function)]
-    fn new(config: &Config, path: PathBuf) -> Self {
+    fn new(config: &Config, path: impl AsRef<Path>) -> Self {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .journal_mode(SqliteJournalMode::Wal)

@@ -3,8 +3,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::mem;
 use std::sync::Arc;
+use std::{fs, mem};
 
 use calloop::LoopHandle;
 use skia_safe::{Color4f, Paint, Rect};
@@ -13,6 +13,7 @@ use tracing::error;
 use crate::config::{Config, Input};
 use crate::geometry::{Point, Size, rect_contains};
 use crate::region::{DownloadState, Region, Regions};
+use crate::tiles::Tiles;
 use crate::ui::skia::RenderState;
 use crate::ui::view::{UiView, View};
 use crate::ui::{Button, Svg, Velocity};
@@ -46,6 +47,7 @@ const ALT_FONT_SIZE: f32 = 0.5;
 pub struct DownloadView {
     regions: Arc<Regions>,
     current_region: [usize; 5],
+    tiles_size: u64,
 
     back_button: Button,
     alt_bg_paint: Paint,
@@ -98,6 +100,7 @@ impl DownloadView {
             scale: 1.,
             scroll_offset: Default::default(),
             touch_state: Default::default(),
+            tiles_size: Default::default(),
         })
     }
 
@@ -423,10 +426,24 @@ impl UiView for DownloadView {
         // Reset region clipping mask.
         render_state.restore();
 
-        // Draw total installation size for this region.
+        let mut label_point: Point<f32> = self.installed_label_point().into();
+        let label_size = self.installed_label_size();
 
-        let mut installed_label_point = self.installed_label_point();
-        let installed_label_size = self.installed_label_size();
+        // Layout tile storage size text if the toplevel region is displayed.
+        let tiles_size_paragraph = (self.current_region[0] == usize::MAX).then(|| {
+            let mut builder = render_state.paragraph(config.colors.foreground, 1., None);
+            let mut tiles_size_text = String::with_capacity("Tiles: X.XXGB".len());
+            tiles_size_text.push_str("Tiles: ");
+            format_size(&mut tiles_size_text, self.tiles_size);
+            builder.add_text(&tiles_size_text);
+
+            let mut paragraph = builder.build();
+            paragraph.layout(label_size.width as f32);
+
+            paragraph
+        });
+
+        // Layout region's installation size text.
 
         let mut builder = render_state.paragraph(config.colors.foreground, 1., None);
         let mut downloaded_text = String::with_capacity("Downloaded: X.XX GB".len());
@@ -434,13 +451,22 @@ impl UiView for DownloadView {
         format_size(&mut downloaded_text, region.current_install_size());
         builder.add_text(&downloaded_text);
 
-        let mut paragraph = builder.build();
-        paragraph.layout(installed_label_size.width as f32);
+        let mut region_size_paragraph = builder.build();
+        region_size_paragraph.layout(label_size.width as f32);
 
         // Draw text vertically centered in its space.
-        let y_offset = ((installed_label_size.height as f32 - paragraph.height()) / 2.).round();
-        installed_label_point.y += y_offset as i32;
-        paragraph.paint(&render_state, installed_label_point);
+
+        let tiles_size_height = tiles_size_paragraph.as_ref().map_or(0., |p| p.height());
+        let region_size_height = region_size_paragraph.height();
+        let y_offset = (label_size.height as f32 - region_size_height - tiles_size_height) / 2.;
+        label_point.y += y_offset;
+
+        region_size_paragraph.paint(&render_state, label_point);
+
+        if let Some(paragraph) = tiles_size_paragraph {
+            label_point.y += region_size_height;
+            paragraph.paint(&render_state, label_point);
+        }
 
         // Render navigation button.
         self.back_button.draw(&mut render_state, config.colors.alt_background);
@@ -619,6 +645,14 @@ impl UiView for DownloadView {
             self.input_config = config.input;
             self.dirty = true;
         }
+    }
+
+    fn enter(&mut self) {
+        // Update current tiles storage size.
+        self.tiles_size = Tiles::tiles_path()
+            .ok()
+            .and_then(|path| fs::metadata(path).ok())
+            .map_or(0, |metadata| metadata.len());
     }
 
     fn as_any(&mut self) -> &mut dyn Any {
