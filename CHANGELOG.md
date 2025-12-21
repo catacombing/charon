@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - Switched to a dark theme using jawg.io
+- Search is no longer cleared when changing back to the map view
 
 ### Fixed
 

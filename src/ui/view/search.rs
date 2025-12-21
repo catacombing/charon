@@ -475,11 +475,9 @@ impl UiView for SearchView {
     }
 
     fn enter(&mut self) {
-        // Reset and refocus text field when the view is opened.
+        // Refocus text field when the view is opened.
         self.search_field.set_keyboard_focus(self.keyboard_focused);
         self.search_field.set_ime_focus(self.ime_focused);
-        self.search_field.set_text("");
-        self.geocoder.clear_results();
         self.search_focused = true;
     }
 

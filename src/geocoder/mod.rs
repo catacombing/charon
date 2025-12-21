@@ -133,14 +133,6 @@ impl Geocoder {
         self.nominatim_searching || self.nlp_searching
     }
 
-    /// Clear current search query and results.
-    pub fn clear_results(&mut self) {
-        self.last_query = QueryId::new();
-        self.nominatim_searching = false;
-        self.nlp_searching = false;
-        self.results.clear();
-    }
-
     /// Handle config updates.
     pub fn update_config(&mut self, config: &Config) {
         // Restart Nominatim geocoder on URL change.
