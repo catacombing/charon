@@ -138,8 +138,13 @@ impl Views {
 
         let download_view =
             Box::new(DownloadView::new(event_loop.clone(), config, regions.clone(), size)?);
-        let search_view =
-            Box::new(SearchView::new(event_loop.clone(), config, regions.clone(), size)?);
+        let search_view = Box::new(SearchView::new(
+            event_loop.clone(),
+            client.clone(),
+            config,
+            regions.clone(),
+            size,
+        )?);
         let map_view = Box::new(MapView::new(event_loop.clone(), client, config, regions, size)?);
 
         Ok(Self { views: [map_view, search_view, download_view], active_view: Default::default() })

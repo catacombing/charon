@@ -39,6 +39,8 @@ pub struct Config {
     pub colors: Colors,
     /// This section documents the `[tiles]` table.
     pub tiles: Tiles,
+    /// This section documents the `[search]` table.
+    pub search: Search,
     /// This section documents the `[input]` table.
     pub input: Input,
 }
@@ -100,7 +102,7 @@ impl Default for Colors {
 pub struct Tiles {
     /// Raster tile server.
     ///
-    /// This should be your tile server's URI, using the variables `{x}` and
+    /// This should be your tile server's URL, using the variables `{x}` and
     /// `{y}` for the tile numbers and `{z}` for the zoom level.
     #[docgen(
         default = "https://tile.jawg.io/c09eed68-abaf-45b9-bed8-8bb2076013d7/{z}/{x}/{y}.png"
@@ -136,6 +138,22 @@ impl Default for Tiles {
             max_mem_tiles: 1_000,
             max_fs_tiles: 50_000,
         }
+    }
+}
+
+/// Options related to geocoding.
+#[derive(Docgen, Deserialize, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct Search {
+    /// URL base of the Nominatim geocoding server.
+    ///
+    /// An empty URL will disable online geocoding.
+    pub nominatim_url: Arc<String>,
+}
+
+impl Default for Search {
+    fn default() -> Self {
+        Self { nominatim_url: Arc::new("https://nominatim.openstreetmap.org".into()) }
     }
 }
 

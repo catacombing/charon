@@ -1,5 +1,6 @@
-//! Geocoding using geocoder-nlp.
+//! Offline geocoding using geocoder-nlp.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::thread::Builder as ThreadBuilder;
@@ -8,10 +9,10 @@ use calloop::channel;
 use geocoder_nlp::Geocoder as GeocoderNlp;
 use tracing::{error, info, warn};
 
-use crate::Error;
 use crate::geocoder::{Query, QueryId, QueryResult, QueryResultEvent, QueryResultRank};
 use crate::geometry::GeoPoint;
 use crate::region::Regions;
+use crate::{Error, entity_type};
 
 /// Geocoder NLP orchestrator.
 pub struct Geocoder {
@@ -42,18 +43,22 @@ impl Geocoder {
         info!("Starting Geocoder NLP");
 
         let postal_global_path = self.regions.postal_global_path();
+        let entity_types = entity_type::entity_types();
 
         while let Ok(query) = self.query_rx.recv() {
-            self.query(&postal_global_path, query);
+            self.query(&postal_global_path, entity_types, query);
         }
 
         info!("Shutting down Geocoder NLP");
     }
 
     /// Process a geocoding query.
-    fn query(&mut self, postal_global_path: &Path, query: Query) {
-        let entity_types = crate::entity_type::entity_types();
-
+    fn query(
+        &mut self,
+        postal_global_path: &Path,
+        entity_types: &HashMap<&str, &'static str>,
+        query: Query,
+    ) {
         self.regions.world().for_installed(&mut |region| {
             // Get region-specific geocoding data paths.
             let postal_country_path = match self.regions.postal_country_root(region) {
@@ -123,18 +128,17 @@ impl Geocoder {
                 let distance = query.reference_point.map(|_| result.distance().round() as u32);
                 let point = GeoPoint::new(result.latitude(), result.longitude());
                 let rank = QueryResultRank::Nlp(result.search_rank());
-                let postal_code = match result.postal_code().trim() {
-                    "" => None,
-                    postal_code => Some(postal_code.to_string()),
+                let address = match result.postal_code().trim() {
+                    "" => result.address().to_string(),
+                    postal_code => format!("{}, {}", postal_code, result.address()),
                 };
 
                 query_results.push(QueryResult {
                     entity_type,
-                    postal_code,
                     distance,
+                    address,
                     point,
                     rank,
-                    address: result.address().to_string(),
                     title: result.title().to_string(),
                 });
             }
@@ -144,6 +148,6 @@ impl Geocoder {
         });
 
         // Mark this query as done.
-        let _ = self.result_tx.send((query.id, QueryResultEvent::Done));
+        let _ = self.result_tx.send((query.id, QueryResultEvent::NlpDone));
     }
 }

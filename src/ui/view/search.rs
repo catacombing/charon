@@ -8,6 +8,7 @@ use std::mem;
 use std::sync::Arc;
 
 use calloop::LoopHandle;
+use reqwest::Client;
 use skia_safe::textlayout::TextAlign;
 use skia_safe::{Color4f, Paint, Rect};
 use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers};
@@ -78,11 +79,12 @@ impl SearchView {
     #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn new(
         event_loop: LoopHandle<'static, State>,
+        client: Client,
         config: &Config,
         regions: Arc<Regions>,
         size: Size,
     ) -> Result<Self, Error> {
-        let geocoder = Geocoder::new(event_loop.clone(), regions)?;
+        let geocoder = Geocoder::new(event_loop.clone(), config, client, regions)?;
 
         // Initialize UI elements.
 
@@ -207,11 +209,7 @@ impl SearchView {
         let options = TextOptions::new().ellipsize(false);
         let mut builder =
             render_state.paragraph(config.colors.alt_foreground, ADDRESS_FONT_SIZE, options);
-        let text = match &result.postal_code {
-            Some(postal_code) => Cow::Owned(format!("{}, {}", postal_code, result.address)),
-            None => Cow::Borrowed(result.address.as_str()),
-        };
-        builder.add_text(text);
+        builder.add_text(&result.address);
 
         let mut address_paragraph = builder.build();
         address_paragraph.layout(text_width);
@@ -709,6 +707,8 @@ impl UiView for SearchView {
 
     #[cfg_attr(feature = "profiling", profiling::function)]
     fn update_config(&mut self, config: &Config) {
+        self.geocoder.update_config(config);
+
         if self.input_config != config.input {
             self.input_config = config.input;
             self.dirty = true;

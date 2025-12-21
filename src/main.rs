@@ -20,12 +20,12 @@ use smithay_client_toolkit::reexports::client::{
     ConnectError, Connection, DispatchError, QueueHandle,
 };
 use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers, RepeatInfo};
-use crate::ui::view::map::MapView;
-use crate::ui::view::View;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 use crate::config::{Config, ConfigEventHandler};
+use crate::ui::view::View;
+use crate::ui::view::map::MapView;
 use crate::ui::window::Window;
 use crate::wayland::{ProtocolStates, TextInput};
 

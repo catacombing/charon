@@ -260,6 +260,24 @@ impl GeoPoint {
 
         (index, offset)
     }
+
+    /// Calculate distance in meters between two points.
+    ///
+    /// This uses the haversine formula, which is inaccurate due to assuming the
+    /// earth is round, but it should suffice for our purposes.
+    pub fn distance(&self, other: Self) -> u32 {
+        const EARTH_RADIUS: f64 = 6_371_000.;
+
+        let slat = self.lat.to_radians();
+        let olat = other.lat.to_radians();
+        let delta_lat = (self.lat - other.lat).to_radians();
+        let delta_lon = (self.lon - other.lon).to_radians();
+
+        let a = (delta_lat / 2.).sin().powi(2)
+            + slat.cos() * olat.cos() * (delta_lon / 2.).sin().powi(2);
+        let c = 2. * a.sqrt().atan2((1. - a).sqrt());
+        (EARTH_RADIUS * c).round() as u32
+    }
 }
 
 /// Check if a rectangle contains a point.
@@ -308,5 +326,16 @@ mod tests {
         let offset = Point::new(128, 128);
         let point = GeoPoint::from_tile(tile, offset);
         assert_eq!(point, GeoPoint::new(51.15867686442365, 6.866455078125));
+    }
+
+    #[test]
+    fn distance() {
+        let a = GeoPoint::new(0., 0.);
+        let b = GeoPoint::new(0., 0.);
+        assert_eq!(a.distance(b), 0);
+
+        let a = GeoPoint::new(48.8566, 2.3522);
+        let b = GeoPoint::new(50.0647, 19.9450);
+        assert_eq!(a.distance(b), 1_275_570);
     }
 }

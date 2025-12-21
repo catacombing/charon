@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - Show tiles cache size in region management UI
+- Online Nominatim geocoding
 
 ### Changed
 
