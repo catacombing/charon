@@ -321,13 +321,13 @@ impl Tile {
         db_tile: Option<DbTile>,
     ) -> Result<Image, Error> {
         // Get image from tileserver.
-        let uri = state
+        let url = state
             .server
             .replace("{x}", &index.x.to_string())
             .replace("{y}", &index.y.to_string())
             .replace("{z}", &index.z.to_string());
         let send_request = async || {
-            let response = state.client.get(&uri).send().await?.error_for_status()?;
+            let response = state.client.get(&url).send().await?.error_for_status()?;
             Ok::<_, Error>(response.bytes().await?)
         };
         let data = send_request().await;
@@ -351,7 +351,7 @@ impl Tile {
 
         // Try to decode bytes as image.
         let image =
-            Image::from_encoded(Data::new_copy(&data)).ok_or_else(|| Error::InvalidImage(uri))?;
+            Image::from_encoded(Data::new_copy(&data)).ok_or_else(|| Error::InvalidImage(url))?;
 
         // Notify renderer about new map download completion.
         let _ = state.tile_tx.send(index);
@@ -467,7 +467,17 @@ impl FsCache {
 
     /// Close the SQLite database connection.
     pub async fn close(&self) {
-        self.pool.wait().await.close().await;
+        let pool = self.pool.wait().await;
+
+        // Defragment and truncate database file.
+        //
+        // This takes a while ~1s and blocks other database operations, so we just do it
+        // on exit.
+        if let Err(err) = sqlx::query("VACUUM").execute(pool).await {
+            error!("SQLite vacuum failed: {err}");
+        }
+
+        pool.close().await;
     }
 
     /// Add a new tile to the cache.
@@ -528,9 +538,6 @@ impl FsCache {
         .bind(self.capacity)
         .execute(pool)
         .await?;
-
-        // Defragment and truncate database file.
-        sqlx::query("VACUUM").execute(pool).await?;
 
         Ok(())
     }
