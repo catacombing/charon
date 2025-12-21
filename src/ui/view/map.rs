@@ -31,18 +31,26 @@ const SEARCH_BUTTON_BORDER: f64 = 1.;
 /// Attribution label font size relative to the default.
 const ATTRIBUTION_FONT_SIZE: f32 = 0.5;
 
+/// POI circle radius at scale 1.
+const POI_RADIUS: f32 = 5.;
+
+/// POI border size at scale 1.
+const POI_BORDER: f32 = 2.;
+
 /// Map rendering UI view.
 pub struct MapView {
     pending_tiles: Vec<TileIndex>,
     regions: Arc<Regions>,
     tiles: Tiles,
+    poi_tile: Option<TileIndex>,
+    poi_offset: Option<Point>,
+    poi: Option<GeoPoint>,
 
     cursor_tile: TileIndex,
     cursor_offset: Point,
     cursor_zoom: f64,
 
     search_button: Button,
-
     tile_paint: Paint,
 
     touch_state: TouchState,
@@ -107,6 +115,9 @@ impl MapView {
             pending_tiles: Default::default(),
             cursor_zoom: Default::default(),
             touch_state: Default::default(),
+            poi_offset: Default::default(),
+            poi_tile: Default::default(),
+            poi: Default::default(),
         })
     }
 
@@ -133,6 +144,14 @@ impl MapView {
             self.cursor_offset = cursor_offset;
             self.dirty = true;
         }
+    }
+
+    /// Highlight a specific point on the map.
+    pub fn set_poi(&mut self, point: Option<GeoPoint>) {
+        self.dirty |= self.poi != point;
+        self.poi_offset = None;
+        self.poi_tile = None;
+        self.poi = point;
     }
 
     /// Move the map by a pixel delta.
@@ -362,6 +381,31 @@ impl UiView for MapView {
             let mut paragraph = builder.build();
             paragraph.layout(size.width as f32);
             paragraph.paint(&render_state, Point::new(0., 0.));
+        }
+
+        // Draw POI if visible.
+        if let Some(poi) = self.poi {
+            // Convert geographic point to tile index + offset and cache it.
+            let (tile, offset) = match (self.poi_tile, self.poi_offset) {
+                (Some(tile), Some(offset)) if tile.z == self.cursor_tile.z => (tile, offset),
+                _ => {
+                    let (tile, offset) = poi.tile(self.cursor_tile.z);
+                    self.poi_tile = Some(tile);
+                    self.poi_offset = Some(offset);
+                    (tile, offset)
+                },
+            };
+
+            if let Some(point) = iter.screen_point(tile, offset) {
+                let poi_radius = POI_RADIUS * self.scale as f32;
+                let border_radius = poi_radius + POI_BORDER * self.scale as f32;
+
+                self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
+                render_state.draw_circle(point, border_radius, &self.tile_paint);
+
+                self.tile_paint.set_color4f(Color4f::from(config.colors.highlight), None);
+                render_state.draw_circle(point, poi_radius, &self.tile_paint);
+            }
         }
 
         // Draw search button with a border to distinguish it from the map.

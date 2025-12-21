@@ -144,9 +144,16 @@ impl SearchView {
         self.last_query = self.search_field.text().to_owned();
         self.dirty = true;
 
+        // Submit background query.
         let mut query = Query::new(&self.last_query);
         query.set_reference(self.reference_point, self.reference_zoom);
         self.geocoder.query(query);
+
+        // Clear current POI map marker.
+        self.event_loop.insert_idle(move |state| {
+            let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
+            map_view.set_poi(None);
+        });
     }
 
     /// Update the search reference point.
@@ -616,6 +623,7 @@ impl UiView for SearchView {
                     self.event_loop.insert_idle(move |state| {
                         let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
                         map_view.goto(point, zoom);
+                        map_view.set_poi(Some(point));
                         state.window.set_view(View::Map);
                     });
                 }

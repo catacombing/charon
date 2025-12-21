@@ -131,16 +131,19 @@ pub struct TileIter {
     tile_count: u32,
     tile_size: i32,
 
+    screen_size: Size,
+    scale: f64,
+
     index: u32,
 }
 
 impl TileIter {
-    pub fn new(size: Size, mut tile_index: TileIndex, offset: Point, scale: f64) -> Self {
+    pub fn new(screen_size: Size, mut tile_index: TileIndex, offset: Point, scale: f64) -> Self {
         // Get position of the tile's top-left on the screen.
         let x_offset = (offset.x as f64 * scale).round() as i32;
         let y_offset = (offset.y as f64 * scale).round() as i32;
-        let x_origin = size.width as i32 / 2 - x_offset;
-        let y_origin = size.height as i32 / 2 - y_offset;
+        let x_origin = screen_size.width as i32 / 2 - x_offset;
+        let y_origin = screen_size.height as i32 / 2 - y_offset;
 
         // Get top-left tile's indices and offset.
         let tile_size = (TILE_SIZE as f64 * scale).round() as i32;
@@ -154,21 +157,23 @@ impl TileIter {
 
         let tile_count = 1 << tile_index.z as u32;
 
-        let available_x = size.width as i32 - origin.x;
+        let available_x = screen_size.width as i32 - origin.x;
         let tiles_x = ((available_x + tile_size - 1) / tile_size) as u32;
         let max_tiles_x = tiles_x.min(tile_count - tile_index.x);
 
-        let available_y = size.height as i32 - origin.y;
+        let available_y = screen_size.height as i32 - origin.y;
         let tiles_y = ((available_y + tile_size - 1) / tile_size) as u32;
         let max_tiles_y = tiles_y.min(tile_count - tile_index.y);
 
         Self {
             max_tiles_x,
             max_tiles_y,
+            screen_size,
             tile_index,
             tile_count,
             tile_size,
             origin,
+            scale,
             index: Default::default(),
         }
     }
@@ -195,6 +200,32 @@ impl TileIter {
             .chain(iter::repeat(min_x).zip(left_range))
             .chain(iter::repeat(max_x).zip(right_range))
             .map(|(x, y)| TileIndex::new(x, y, self.tile_index.z))
+    }
+
+    /// Get physical position of a map point on the screen.
+    ///
+    /// The supplied `tile_index` must have a `z` coordinate matching the
+    /// iterator's `z` coordinate.
+    pub fn screen_point(&self, tile_index: TileIndex, offset: Point) -> Option<Point> {
+        let x_delta = tile_index.x.checked_sub(self.tile_index.x)? as i32;
+        let y_delta = tile_index.y.checked_sub(self.tile_index.y)? as i32;
+
+        // Apply fractional scale to tile offset.
+        let mut point = self.origin + offset * self.scale;
+
+        point.x += x_delta * self.tile_size;
+        point.y += y_delta * self.tile_size;
+
+        // Check whether point is visible.
+        if point.x < 0
+            || point.y < 0
+            || point.x >= self.screen_size.width as i32
+            || point.y >= self.screen_size.height as i32
+        {
+            None
+        } else {
+            Some(point)
+        }
     }
 
     /// Target width and height of the tile.

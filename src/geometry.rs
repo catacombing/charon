@@ -102,6 +102,16 @@ impl<T: SubAssign> SubAssign<Point<T>> for Point<T> {
     }
 }
 
+impl Mul<f64> for Point {
+    type Output = Point;
+
+    fn mul(mut self, scale: f64) -> Self {
+        self.x = (self.x as f64 * scale).round() as i32;
+        self.y = (self.y as f64 * scale).round() as i32;
+        self
+    }
+}
+
 impl Div<f64> for Point {
     type Output = Point;
 
