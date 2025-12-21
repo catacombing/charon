@@ -417,7 +417,7 @@ impl UiView for MapView {
     }
 
     #[cfg_attr(feature = "profiling", profiling::function)]
-    fn touch_down(&mut self, slot: i32, _time: u32, point: Point<f64>) {
+    fn touch_down(&mut self, slot: i32, time: u32, point: Point<f64>) {
         let point = point * self.scale;
 
         // Cancel velocity if a new touch sequence starts.
@@ -429,7 +429,24 @@ impl UiView for MapView {
             0 if self.search_button.contains(point) => {
                 self.touch_state.action = TouchAction::Search;
             },
-            0 => self.touch_state.action = TouchAction::Tap,
+            0 => {
+                // Calculate delta to last tap.
+                let elapsed =
+                    self.touch_state.last_time + self.input_config.max_multi_tap.as_millis() as u32;
+                let delta = self.touch_state.last_point - point;
+                let distance = delta.x.powi(2) + delta.y.powi(2);
+
+                self.touch_state.action =
+                    if elapsed >= time && distance <= self.input_config.max_tap_distance {
+                        TouchAction::DoubleTap
+                    } else {
+                        TouchAction::Tap
+                    };
+
+                // Update state for multi-tap detection.
+                self.touch_state.last_time = time;
+                self.touch_state.last_point = point;
+            },
             1 => self.touch_state.action = TouchAction::Zoom,
             _ => return,
         }
@@ -454,7 +471,7 @@ impl UiView for MapView {
 
         // Update the map position.
         match self.touch_state.action {
-            TouchAction::Tap | TouchAction::Drag => {
+            TouchAction::Tap | TouchAction::DoubleTap | TouchAction::Drag => {
                 // Ignore dragging until tap distance limit is exceeded.
                 let max_tap_distance = self.input_config.max_tap_distance;
                 let delta = slot.point - slot.start;
@@ -513,6 +530,11 @@ impl UiView for MapView {
         match self.touch_state.action {
             // On tap, snap zoom to nearest integer scale.
             TouchAction::Tap => self.snap_zoom(),
+            // Zoom in to next tile level on double-tap.
+            TouchAction::DoubleTap if self.cursor_tile.z < MAX_ZOOM => {
+                self.touch_state.zoom_focus = removed.point;
+                self.zoom_by(2.);
+            },
             // Handle search button press.
             TouchAction::Search if self.search_button.contains(removed.point) => {
                 // Show download view if no regions have been downloaded yet.
@@ -524,6 +546,11 @@ impl UiView for MapView {
                 self.event_loop.insert_idle(move |state| state.window.set_view(view));
             },
             _ => (),
+        }
+
+        // Block multi-tap if last action didn't result in a tap.
+        if self.touch_state.action != TouchAction::Tap {
+            self.touch_state.last_time = 0;
         }
 
         // Require all slots to be cleared to allow moving the map again.
@@ -553,6 +580,9 @@ struct TouchState {
     slots: HashMap<i32, TouchSlot>,
     action: TouchAction,
 
+    last_point: Point<f64>,
+    last_time: u32,
+
     move_velocity: Velocity,
 
     zoom_velocity: Velocity,
@@ -574,6 +604,7 @@ enum TouchAction {
     #[default]
     None,
 
+    DoubleTap,
     Search,
     Drag,
     Zoom,
