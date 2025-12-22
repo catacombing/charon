@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "charon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "bzip2",
@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "geocoder_nlp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cc",
  "cxx",

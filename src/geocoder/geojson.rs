@@ -49,6 +49,7 @@ pub enum FeatureId {
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 pub enum Geometry {
+    #[allow(clippy::enum_variant_names)]
     GeometryCollection(GeometryCollection),
     Point(Coordinate1),
     MultiPoint(Coordinate2),

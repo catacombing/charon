@@ -1,6 +1,6 @@
 [package]
 name = "geocoder_nlp"
-version = "0.2.0"
+version = "0.2.1"
 description = "Rust bindings for geocoder-nlp"
 authors = ["Christian Duerr <contact@christianduerr.com>"]
 repository = "https://github.com/catacombing/charon"
