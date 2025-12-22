@@ -46,7 +46,7 @@ reqwest = { version = "0.12.24", default-features = false, features = ["native-t
 resvg = { version = "0.45.1", default-features = false }
 serde_json = "1.0.145"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
-skia-safe = { version = "0.90.0", features = ["all-linux", "textlayout"] }
+skia-safe = { version = "0.91.0", features = ["all-linux", "textlayout"] }
 smithay-client-toolkit = { version = "0.20.0", default-features = false, features = ["xkbcommon"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "macros", "migrate", "sqlite"] }
 tempfile = "3.23.0"
