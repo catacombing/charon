@@ -145,7 +145,7 @@ impl Views {
             regions.clone(),
             size,
         )?);
-        let map_view = Box::new(MapView::new(event_loop.clone(), client, config, regions, size)?);
+        let map_view = Box::new(MapView::new(event_loop.clone(), client, config, size)?);
 
         Ok(Self { views: [map_view, search_view, download_view], active_view: Default::default() })
     }

@@ -3,7 +3,6 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::mem;
-use std::sync::Arc;
 
 use calloop::channel::{self, Event};
 use calloop::timer::{TimeoutAction, Timer};
@@ -14,7 +13,6 @@ use tracing::error;
 
 use crate::config::{Config, Input};
 use crate::geometry::{GeoPoint, Point, Size};
-use crate::region::Regions;
 use crate::tiles::{MAX_ZOOM, TILE_SIZE, TileIndex, TileIter, Tiles};
 use crate::ui::skia::RenderState;
 use crate::ui::view::search::SearchView;
@@ -43,7 +41,6 @@ const POI_BORDER: f32 = 2.;
 /// Map rendering UI view.
 pub struct MapView {
     pending_tiles: Vec<TileIndex>,
-    regions: Arc<Regions>,
     tiles: Tiles,
     poi_tile: Option<TileIndex>,
     poi_offset: Option<Point>,
@@ -73,7 +70,6 @@ impl MapView {
         event_loop: LoopHandle<'static, State>,
         client: Client,
         config: &Config,
-        regions: Arc<Regions>,
         size: Size,
     ) -> Result<Self, Error> {
         // Initialize the tile cache.
@@ -109,7 +105,6 @@ impl MapView {
             cursor_tile,
             event_loop,
             tile_paint,
-            regions,
             tiles,
             size,
             input_config: config.input,
@@ -632,13 +627,7 @@ impl UiView for MapView {
             },
             // Handle search button press.
             TouchAction::Search if self.search_button.contains(removed.point) => {
-                // Show download view if no regions have been downloaded yet.
-                let view = if self.regions.world().current_install_size() > 0 {
-                    View::Search
-                } else {
-                    View::Download
-                };
-                self.event_loop.insert_idle(move |state| state.window.set_view(view));
+                self.event_loop.insert_idle(move |state| state.window.set_view(View::Search));
             },
             _ => (),
         }
