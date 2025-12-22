@@ -1,6 +1,7 @@
 pub use ffi::*;
 
 #[allow(clippy::module_inception)]
+#[allow(clippy::too_many_arguments)]
 #[cxx::bridge]
 mod ffi {
     #[namespace = "GeoNLP"]
@@ -19,6 +20,16 @@ mod ffi {
             result: Pin<&mut CxxVector<GeoResult>>,
             min_levels: u64,
             reference: &GeoReference,
+        ) -> bool;
+        fn search_nearby(
+            self: Pin<&mut Geocoder>,
+            name_query: &CxxVector<CxxString>,
+            type_query: &CxxVector<CxxString>,
+            latitude: f64,
+            longitude: f64,
+            radius: f64,
+            result: Pin<&mut CxxVector<GeoResult>>,
+            postal: Pin<&mut Postal>,
         ) -> bool;
 
         type GeoReference;

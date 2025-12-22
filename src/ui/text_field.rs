@@ -323,6 +323,23 @@ impl TextField {
         self.ime_focused = focused;
     }
 
+    /// Replace the entire text box content.
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        if self.text == text {
+            return;
+        }
+
+        self.cursor_index = text.len();
+        self.focus_cursor = true;
+        self.text = text;
+
+        self.clear_selection();
+
+        self.text_input_dirty = true;
+        self.dirty = true;
+    }
+
     /// Get the field's current text content.
     pub fn text(&self) -> &str {
         &self.text

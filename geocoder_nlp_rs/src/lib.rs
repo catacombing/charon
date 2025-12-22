@@ -254,6 +254,55 @@ impl Geocoder {
         Ok(SearchIter { results, index: 0 })
     }
 
+    /// Find POIs at the specified location.
+    ///
+    /// The search radius is not limited internally, which will become
+    /// pathological at some point based on radius and geocoder region size.
+    /// Since result rank is based on distance, the radius can usually be
+    /// limited to a kilometer or less without affecting results.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use geocoder_nlp::Geocoder;
+    ///
+    /// let mut geocoder = Geocoder::new("/tmp/postal", "/tmp/postal", "/tmp/geocoder").unwrap();
+    ///
+    /// // Get entities at the specified lat/lon in a 10 meter radius.
+    /// let mut results = geocoder.reverse(42.224966, -8.670664, 10.).unwrap();
+    ///
+    /// // Output results in descending relevance.
+    /// while let Some(result) = results.next() {
+    ///     println!("Title: {}", result.title());
+    ///     println!("Latitude: {}, Longitude: {}", result.latitude(), result.longitude());
+    ///     println!("Address: {} {}", result.postal_code(), result.address());
+    ///     println!();
+    /// }
+    /// ```
+    pub fn reverse(
+        &mut self,
+        latitude: f64,
+        longitude: f64,
+        radius: f64,
+    ) -> Result<SearchIter, Error> {
+        let mut results = CxxVector::new();
+        let success = self.geocoder.pin_mut().search_nearby(
+            &CxxVector::new(),
+            &CxxVector::new(),
+            latitude,
+            longitude,
+            radius,
+            results.pin_mut(),
+            self.postal.pin_mut(),
+        );
+
+        if !success {
+            return Err(Error::PostalInit);
+        }
+
+        Ok(SearchIter { results, index: 0 })
+    }
+
     /// Get the maximum number of results returned by [`Self::search`].
     ///
     /// # Examples
@@ -269,7 +318,11 @@ impl Geocoder {
         self.geocoder.get_max_results()
     }
 
-    /// Set the maximum number of results returned by [`Self::search`].
+    /// Set the number of search results returned.
+    ///
+    /// This limit applies to both [`Self::search`] and [`Self::reverse`].
+    ///
+    /// The default limit is `10`.
     ///
     /// # Examples
     ///

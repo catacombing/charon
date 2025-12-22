@@ -301,6 +301,14 @@ where
         && point.y < rect_point.y + rect_size.height
 }
 
+/// Get pixel size in meters for a certain zoom level and latitude.
+pub fn pixel_size(lat: f64, zoom: u8) -> f64 {
+    const EARTH_EQUATOR: f64 = 40_075_016.686;
+    const ZERO_PIXEL_SIZE: f64 = EARTH_EQUATOR / TILE_SIZE as f64;
+
+    ZERO_PIXEL_SIZE * lat.to_radians().cos() / 2f64.powi(zoom as i32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +355,15 @@ mod tests {
         let a = GeoPoint::new(48.8566, 2.3522);
         let b = GeoPoint::new(50.0647, 19.9450);
         assert_eq!(a.distance(b), 1_275_570);
+    }
+
+    #[test]
+    fn meters_per_pixel() {
+        for lat in 0..90 {
+            let lat = lat as f64;
+            assert_eq!(pixel_size(lat, 0), 156543.0339296875 * lat.to_radians().cos());
+            assert_eq!(pixel_size(lat, 9), 305.7481131439209 * lat.to_radians().cos());
+            assert_eq!(pixel_size(lat, 18), 0.5971642834842205 * lat.to_radians().cos());
+        }
     }
 }

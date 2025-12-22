@@ -14,7 +14,7 @@ use skia_safe::{Color4f, Paint, Rect};
 use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers};
 
 use crate::config::{Config, Input};
-use crate::geocoder::{Geocoder, Query, QueryResult};
+use crate::geocoder::{Geocoder, QueryResult, ReverseQuery, SearchQuery};
 use crate::geometry::{GeoPoint, Point, Size};
 use crate::region::Regions;
 use crate::ui::skia::{RenderState, TextOptions};
@@ -54,6 +54,7 @@ pub struct SearchView {
     last_query: String,
     reference_point: GeoPoint,
     reference_zoom: u8,
+    pending_reverse: bool,
 
     search_field: TextField,
     config_button: Button,
@@ -120,6 +121,7 @@ impl SearchView {
             dirty: true,
             scale: 1.,
             keyboard_focused: Default::default(),
+            pending_reverse: Default::default(),
             reference_point: Default::default(),
             reference_zoom: Default::default(),
             scroll_offset: Default::default(),
@@ -145,15 +147,28 @@ impl SearchView {
         self.dirty = true;
 
         // Submit background query.
-        let mut query = Query::new(&self.last_query);
+        let mut query = SearchQuery::new(&self.last_query);
         query.set_reference(self.reference_point, self.reference_zoom);
-        self.geocoder.query(query);
+        self.geocoder.search(query);
 
         // Clear current POI map marker.
         self.event_loop.insert_idle(move |state| {
             let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
             map_view.set_poi(None);
         });
+    }
+
+    /// Run reverse geocoding search.
+    pub fn reverse(&mut self, point: GeoPoint, zoom: u8) {
+        self.last_query = format!("{} {}", point.lat, point.lon);
+        self.pending_reverse = true;
+        self.dirty = true;
+
+        // Submit background query.
+        let query = ReverseQuery::new(point, zoom);
+        self.geocoder.reverse(query);
+
+        self.search_field.set_text("");
     }
 
     /// Update the search reference point.
@@ -482,10 +497,16 @@ impl UiView for SearchView {
     }
 
     fn enter(&mut self) {
-        // Refocus text field when the view is opened.
-        self.search_field.set_keyboard_focus(self.keyboard_focused);
-        self.search_field.set_ime_focus(self.ime_focused);
-        self.search_focused = true;
+        // Focus input on enter, unless view was opened for reverse geocoding.
+        if mem::take(&mut self.pending_reverse) {
+            self.search_field.set_keyboard_focus(false);
+            self.search_field.set_ime_focus(false);
+            self.search_focused = false;
+        } else {
+            self.search_field.set_keyboard_focus(self.keyboard_focused);
+            self.search_field.set_ime_focus(self.ime_focused);
+            self.search_focused = true;
+        }
     }
 
     #[cfg_attr(feature = "profiling", profiling::function)]

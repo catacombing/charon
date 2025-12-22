@@ -3,7 +3,7 @@
 ## Syntax
 
 Charon's configuration file uses the TOML format. The format's specification
-can be found at _https://toml.io/en/v1.0.0_.
+can be found at _<https://toml.io/en/v1.0.0>_.
 
 ## Location
 
@@ -50,7 +50,7 @@ This section documents the `[search]` table.
 
 |Name|Description|Type|Default|
 |-|-|-|-|
-|nominatim_url|URL base of the Nominatim geocoding server.<br><br>An empty URL will disable online geocoding.|text|`"https://nominatim.openstreetmap.org"`|
+|photon_url|URL base of the Photon geocoding server.<br><br>An empty URL will disable online geocoding.|text|`"https://photon.komoot.io"`|
 
 ### input
 
@@ -62,3 +62,4 @@ This section documents the `[input]` table.
 |velocity_friction|Percentage of velocity retained each tick|float|`0.85`|
 |max_tap_distance|Square of the maximum distance before touch input is considered a drag|float|`400.0`|
 |max_multi_tap|Maximum interval between taps to be considered a double/trible-tap|integer (milliseconds)|`300`|
+|long_press|Minimum time before a tap is considered a long-press|integer (milliseconds)|`750`|

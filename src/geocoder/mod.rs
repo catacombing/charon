@@ -16,21 +16,22 @@ use crate::ui::view::View;
 use crate::ui::view::search::SearchView;
 use crate::{Error, State};
 
+mod geojson;
 mod nlp;
-mod nominatim;
+mod photon;
 
 /// Multi-provider geocoder.
 pub struct Geocoder {
-    nominatim_query_tx: Option<mpsc::Sender<Query>>,
-    nlp_query_tx: mpsc::Sender<Query>,
+    photon_query_tx: Option<mpsc::Sender<QueryEvent>>,
+    nlp_query_tx: mpsc::Sender<QueryEvent>,
 
     result_tx: channel::Sender<(QueryId, QueryResultEvent)>,
-    nominatim_url: Arc<String>,
+    photon_url: Arc<String>,
     client: Client,
 
     results: Vec<QueryResult>,
     last_query: QueryId,
-    nominatim_searching: bool,
+    photon_searching: bool,
     nlp_searching: bool,
 }
 
@@ -61,16 +62,14 @@ impl Geocoder {
                     // Add results and sort them with the best match first.
                     geocoder.results.extend(results);
                     geocoder.results.sort_unstable_by(|a, b| match (a.rank, b.rank) {
-                        (QueryResultRank::Nominatim(a), QueryResultRank::Nominatim(b)) => b.cmp(&a),
-                        (QueryResultRank::Nominatim(_), QueryResultRank::Nlp(_)) => Ordering::Less,
+                        (QueryResultRank::Photon(a), QueryResultRank::Photon(b)) => a.cmp(&b),
+                        (QueryResultRank::Photon(_), QueryResultRank::Nlp(_)) => Ordering::Less,
                         (QueryResultRank::Nlp(a), QueryResultRank::Nlp(b)) => a.total_cmp(&b),
-                        (QueryResultRank::Nlp(_), QueryResultRank::Nominatim(_)) => {
-                            Ordering::Greater
-                        },
+                        (QueryResultRank::Nlp(_), QueryResultRank::Photon(_)) => Ordering::Greater,
                     });
                 },
-                // Mark current Nominatim search as done.
-                QueryResultEvent::NominatimDone => geocoder.nominatim_searching = false,
+                // Mark current Photon search as done.
+                QueryResultEvent::PhotonDone => geocoder.photon_searching = false,
                 // Mark current Geocoder NLP search as done.
                 QueryResultEvent::NlpDone => geocoder.nlp_searching = false,
             }
@@ -80,47 +79,37 @@ impl Geocoder {
         })?;
 
         // Spawn Geocoder NLP thread.
-        let (nlp_query_tx, nlp_query_rx) = mpsc::channel::<Query>();
+        let (nlp_query_tx, nlp_query_rx) = mpsc::channel::<QueryEvent>();
         nlp::Geocoder::spawn(regions, nlp_query_rx, result_tx.clone())?;
 
-        // Spawn Nominatim geocoder.
-        let nominatim_query_tx = if config.search.nominatim_url.is_empty() {
-            None
-        } else {
-            let (nominatim_query_tx, nominatim_query_rx) = mpsc::channel::<Query>();
-            nominatim::Geocoder::spawn(
-                client.clone(),
-                config,
-                nominatim_query_rx,
-                result_tx.clone(),
-            );
-            Some(nominatim_query_tx)
-        };
+        // Spawn Photon geocoder.
+        let photon_query_tx = (!config.search.photon_url.is_empty()).then(|| {
+            let (photon_query_tx, photon_query_rx) = mpsc::channel::<QueryEvent>();
+            photon::Geocoder::spawn(client.clone(), config, photon_query_rx, result_tx.clone());
+            photon_query_tx
+        });
 
         Ok(Self {
-            nominatim_query_tx,
+            photon_query_tx,
             nlp_query_tx,
             result_tx,
             client,
-            nominatim_url: config.search.nominatim_url.clone(),
+            photon_url: config.search.photon_url.clone(),
             last_query: QueryId::new(),
-            nominatim_searching: Default::default(),
+            photon_searching: Default::default(),
             nlp_searching: Default::default(),
             results: Default::default(),
         })
     }
 
-    /// Submit a new query.
-    pub fn query(&mut self, query: Query) {
-        self.last_query = query.id;
-        self.nominatim_searching = true;
-        self.nlp_searching = true;
-        self.results.clear();
+    /// Submit a search query.
+    pub fn search(&mut self, query: SearchQuery) {
+        self.query(QueryEvent::Search(query));
+    }
 
-        if let Some(query_tx) = &self.nominatim_query_tx {
-            let _ = query_tx.send(query.clone());
-        }
-        let _ = self.nlp_query_tx.send(query);
+    /// Submit a reverse geocoding query.
+    pub fn reverse(&mut self, query: ReverseQuery) {
+        self.query(QueryEvent::Reverse(query));
     }
 
     /// Get current query results.
@@ -130,40 +119,67 @@ impl Geocoder {
 
     /// Check if search is finished.
     pub fn searching(&self) -> bool {
-        self.nominatim_searching || self.nlp_searching
+        self.photon_searching || self.nlp_searching
     }
 
     /// Handle config updates.
     pub fn update_config(&mut self, config: &Config) {
-        // Restart Nominatim geocoder on URL change.
-        if config.search.nominatim_url != self.nominatim_url {
-            self.nominatim_url = config.search.nominatim_url.clone();
-            self.nominatim_query_tx = if config.search.nominatim_url.is_empty() {
-                None
-            } else {
-                let (nominatim_query_tx, nominatim_query_rx) = mpsc::channel::<Query>();
-                nominatim::Geocoder::spawn(
+        // Restart Photon geocoder on URL change.
+        if config.search.photon_url != self.photon_url {
+            self.photon_url = config.search.photon_url.clone();
+            self.photon_query_tx = (!config.search.photon_url.is_empty()).then(|| {
+                let (photon_query_tx, photon_query_rx) = mpsc::channel::<QueryEvent>();
+                photon::Geocoder::spawn(
                     self.client.clone(),
                     config,
-                    nominatim_query_rx,
+                    photon_query_rx,
                     self.result_tx.clone(),
                 );
-                Some(nominatim_query_tx)
-            };
+                photon_query_tx
+            });
+        }
+    }
+
+    /// Submit any type of query to all geocoders.
+    fn query(&mut self, query: QueryEvent) {
+        self.last_query = query.id();
+        self.photon_searching = true;
+        self.nlp_searching = true;
+        self.results.clear();
+
+        if let Some(query_tx) = &self.photon_query_tx {
+            let _ = query_tx.send(query.clone());
+        }
+        let _ = self.nlp_query_tx.send(query);
+    }
+}
+
+/// Geocoder query types.
+#[derive(Clone)]
+pub enum QueryEvent {
+    Search(SearchQuery),
+    Reverse(ReverseQuery),
+}
+
+impl QueryEvent {
+    fn id(&self) -> QueryId {
+        match self {
+            Self::Search(search_query) => search_query.id,
+            Self::Reverse(reverse_query) => reverse_query.id,
         }
     }
 }
 
 /// Geocoding search query.
 #[derive(Clone)]
-pub struct Query {
+pub struct SearchQuery {
     id: QueryId,
     text: String,
     reference_point: Option<GeoPoint>,
     reference_zoom: Option<u8>,
 }
 
-impl Query {
+impl SearchQuery {
     pub fn new(query: impl Into<String>) -> Self {
         Self {
             id: QueryId::new(),
@@ -190,12 +206,26 @@ impl Query {
     }
 }
 
+/// Reverse geocoding query.
+#[derive(Clone)]
+pub struct ReverseQuery {
+    id: QueryId,
+    point: GeoPoint,
+    zoom: u8,
+}
+
+impl ReverseQuery {
+    pub fn new(point: GeoPoint, zoom: u8) -> Self {
+        Self { point, zoom, id: QueryId::new() }
+    }
+}
+
 /// Search query update event.
 pub enum QueryResultEvent {
     /// New query results available.
     Results(Vec<QueryResult>),
-    /// Nominatim search is done, no more results will be delivered.
-    NominatimDone,
+    /// Photon search is done, no more results will be delivered.
+    PhotonDone,
     /// Geocoder NLP search is done, no more results will be delivered.
     NlpDone,
 }
@@ -221,8 +251,8 @@ pub struct QueryResult {
 pub enum QueryResultRank {
     /// Geocoder NLP result rank, lower is better.
     Nlp(f64),
-    /// Nominatim result rank, higher is better.
-    Nominatim(u32),
+    /// Photon result rank, lower is better.
+    Photon(usize),
 }
 
 /// Unique ID of a search query.

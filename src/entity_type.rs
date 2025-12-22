@@ -16,7 +16,7 @@ pub fn entity_types() -> &'static HashMap<&'static str, &'static str> {
 }
 
 /// List of OSM tuples based on:
-/// https://github.com/openstreetmap/openstreetmap-website/blob/master/config/locales/en.yml
+/// <https://github.com/openstreetmap/openstreetmap-website/blob/master/config/locales/en.yml>
 static TUPLES: [(&str, &str); 754] = [
     ("aerialway", "Aerialway"),
     ("aerialway_cable_car", "Cable Car"),

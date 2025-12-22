@@ -22,7 +22,7 @@ use crate::State;
 /// ## Syntax
 ///
 /// Charon's configuration file uses the TOML format. The format's specification
-/// can be found at _https://toml.io/en/v1.0.0_.
+/// can be found at _<https://toml.io/en/v1.0.0>_.
 ///
 /// ## Location
 ///
@@ -145,15 +145,15 @@ impl Default for Tiles {
 #[derive(Docgen, Deserialize, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct Search {
-    /// URL base of the Nominatim geocoding server.
+    /// URL base of the Photon geocoding server.
     ///
     /// An empty URL will disable online geocoding.
-    pub nominatim_url: Arc<String>,
+    pub photon_url: Arc<String>,
 }
 
 impl Default for Search {
     fn default() -> Self {
-        Self { nominatim_url: Arc::new("https://nominatim.openstreetmap.org".into()) }
+        Self { photon_url: Arc::new("https://photon.komoot.io".into()) }
     }
 }
 
@@ -171,12 +171,16 @@ pub struct Input {
     /// Maximum interval between taps to be considered a double/trible-tap.
     #[docgen(doc_type = "integer (milliseconds)", default = "300")]
     pub max_multi_tap: MillisDuration,
+    /// Minimum time before a tap is considered a long-press.
+    #[docgen(doc_type = "integer (milliseconds)", default = "750")]
+    pub long_press: MillisDuration,
 }
 
 impl Default for Input {
     fn default() -> Self {
         Self {
             max_multi_tap: Duration::from_millis(300).into(),
+            long_press: Duration::from_millis(750).into(),
             velocity_friction: 0.85,
             max_tap_distance: 400.,
             velocity_interval: 30,

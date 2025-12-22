@@ -5,16 +5,19 @@ use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
 
-use calloop::LoopHandle;
 use calloop::channel::{self, Event};
+use calloop::timer::{TimeoutAction, Timer};
+use calloop::{LoopHandle, RegistrationToken};
 use reqwest::Client;
 use skia_safe::{Color4f, FilterMode, MipmapMode, Paint, Rect, SamplingOptions};
+use tracing::error;
 
 use crate::config::{Config, Input};
 use crate::geometry::{GeoPoint, Point, Size};
 use crate::region::Regions;
 use crate::tiles::{MAX_ZOOM, TILE_SIZE, TileIndex, TileIter, Tiles};
 use crate::ui::skia::RenderState;
+use crate::ui::view::search::SearchView;
 use crate::ui::view::{UiView, View};
 use crate::ui::{Button, Svg, Velocity};
 use crate::{Error, State};
@@ -154,28 +157,66 @@ impl MapView {
         self.poi = point;
     }
 
+    /// Touch long-press callback.
+    pub fn trigger_long_press(&mut self, mut point: Point<f64>) {
+        // Manually reset touch state, since touch release might be sent to search view.
+        self.touch_state.slots.clear();
+        self.touch_state.last_time = 0;
+
+        // Convert point from screen origin to center origin.
+        let size = self.size * self.scale;
+        point.x -= size.width as f64 / 2.;
+        point.y -= size.height as f64 / 2.;
+
+        // Convert screen point to geographic point.
+        let (tile_index, offset) = self.center_point_tile(point);
+        let geo_point = GeoPoint::from_tile(tile_index, offset);
+
+        // Clear POI marker.
+        self.set_poi(None);
+
+        // Submit query and open search view.
+        self.event_loop.insert_idle(move |state| {
+            let search_view: &mut SearchView = state.window.views.get_mut(View::Search).unwrap();
+            search_view.reverse(geo_point, tile_index.z);
+            state.window.set_view(View::Search);
+        });
+    }
+
     /// Move the map by a pixel delta.
     fn move_by(&mut self, delta: Point<f64>) {
         if delta == Point::default() {
             return;
         }
 
+        let (tile, offset) = self.center_point_tile(delta * -1.);
+        self.cursor_tile = tile;
+        self.cursor_offset = offset;
+
+        self.dirty = true;
+    }
+
+    /// Convert a point relative to the screen's center to a tile + offset.
+    fn center_point_tile(&self, point: Point<f64>) -> (TileIndex, Point) {
+        let mut tile = self.cursor_tile;
+        let mut offset = self.cursor_offset;
+
         // Apply sub-tile scale, since the cursor is in tile coordinates.
         let scale = self.zoom_scale();
-        let x = (-delta.x / scale).round() as i32;
-        let y = (-delta.y / scale).round() as i32;
+        let x = (point.x / scale).round() as i32;
+        let y = (point.y / scale).round() as i32;
 
-        let max_tile = (1 << self.cursor_tile.z) - 1;
-        let offset_x = self.cursor_offset.x + x;
-        let offset_y = self.cursor_offset.y + y;
+        let max_tile = (1 << tile.z) - 1;
+        let offset_x = offset.x + x;
+        let offset_y = offset.y + y;
 
-        // Update center tile.
-        let tile_x = self.cursor_tile.x as i32 + offset_x.div_euclid(TILE_SIZE);
-        let tile_y = self.cursor_tile.y as i32 + offset_y.div_euclid(TILE_SIZE);
-        self.cursor_tile.x = tile_x.clamp(0, max_tile) as u32;
-        self.cursor_tile.y = tile_y.clamp(0, max_tile) as u32;
+        // Calculate tile index.
+        let tile_x = tile.x as i32 + offset_x.div_euclid(TILE_SIZE);
+        let tile_y = tile.y as i32 + offset_y.div_euclid(TILE_SIZE);
+        tile.x = tile_x.clamp(0, max_tile) as u32;
+        tile.y = tile_y.clamp(0, max_tile) as u32;
 
-        // Update offset within center tile.
+        // Calculate tile offset.
         let clamp_offset = |tile: i32, offset: i32| {
             if tile > max_tile {
                 255
@@ -185,10 +226,10 @@ impl MapView {
                 offset.rem_euclid(TILE_SIZE)
             }
         };
-        self.cursor_offset.x = clamp_offset(tile_x, offset_x);
-        self.cursor_offset.y = clamp_offset(tile_y, offset_y);
+        offset.x = clamp_offset(tile_x, offset_x);
+        offset.y = clamp_offset(tile_y, offset_y);
 
-        self.dirty = true;
+        (tile, offset)
     }
 
     /// Zoom the map by a percentage.
@@ -464,7 +505,8 @@ impl UiView for MapView {
     fn touch_down(&mut self, slot: i32, time: u32, point: Point<f64>) {
         let point = point * self.scale;
 
-        // Cancel velocity if a new touch sequence starts.
+        // Cancel velocity/long-press if a new touch sequence starts.
+        self.touch_state.clear_long_press(&self.event_loop);
         self.touch_state.move_velocity.stop();
         self.touch_state.zoom_velocity.stop();
 
@@ -480,12 +522,15 @@ impl UiView for MapView {
                 let delta = self.touch_state.last_point - point;
                 let distance = delta.x.powi(2) + delta.y.powi(2);
 
-                self.touch_state.action =
-                    if elapsed >= time && distance <= self.input_config.max_tap_distance {
-                        TouchAction::DoubleTap
-                    } else {
-                        TouchAction::Tap
-                    };
+                let action = if elapsed >= time && distance <= self.input_config.max_tap_distance {
+                    TouchAction::DoubleTap
+                } else {
+                    // Stage long-press only for initial tap action.
+                    self.touch_state.stage_long_press(&self.event_loop, &self.input_config, point);
+
+                    TouchAction::Tap
+                };
+                self.touch_state.action = action;
 
                 // Update state for multi-tap detection.
                 self.touch_state.last_time = time;
@@ -527,6 +572,9 @@ impl UiView for MapView {
                 let delta = slot.point - old_point;
                 self.touch_state.move_velocity.set(delta);
                 self.move_by(delta);
+
+                // Ensure no long press fires after transitioning to drag.
+                self.touch_state.clear_long_press(&self.event_loop);
             },
             TouchAction::Zoom => {
                 // Get opposing touch slot.
@@ -570,6 +618,9 @@ impl UiView for MapView {
             Some(removed) => removed,
             None => return,
         };
+
+        // Cancel pending long-press timers.
+        self.touch_state.clear_long_press(&self.event_loop);
 
         match self.touch_state.action {
             // On tap, snap zoom to nearest integer scale.
@@ -624,6 +675,7 @@ struct TouchState {
     slots: HashMap<i32, TouchSlot>,
     action: TouchAction,
 
+    long_press_token: Option<RegistrationToken>,
     last_point: Point<f64>,
     last_time: u32,
 
@@ -633,6 +685,37 @@ struct TouchState {
     zoom_velocity_distance: f64,
     velocity_zooming_in: bool,
     zoom_focus: Point<f64>,
+}
+
+impl TouchState {
+    /// Stage time for long-press touch event.
+    fn stage_long_press(
+        &mut self,
+        event_loop: &LoopHandle<'static, State>,
+        input_config: &Input,
+        point: Point<f64>,
+    ) {
+        // Clear any previous timeouts.
+        self.clear_long_press(event_loop);
+
+        // Stage new callback.
+        let timer = Timer::from_duration(*input_config.long_press);
+        let token = event_loop.insert_source(timer, move |_, _, state| {
+            let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
+            map_view.trigger_long_press(point);
+            TimeoutAction::Drop
+        });
+
+        self.long_press_token =
+            token.inspect_err(|err| error!("Failed to stage long-press timer: {err}")).ok();
+    }
+
+    /// Cancel active long-press timer.
+    fn clear_long_press(&mut self, event_loop: &LoopHandle<'static, State>) {
+        if let Some(token) = self.long_press_token.take() {
+            event_loop.remove(token);
+        }
+    }
 }
 
 /// Touch slot state.
