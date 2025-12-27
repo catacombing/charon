@@ -30,6 +30,7 @@ use crate::ui::window::Window;
 use crate::wayland::{ProtocolStates, TextInput};
 
 mod config;
+mod dbus;
 mod entity_type;
 mod geocoder;
 mod geometry;
@@ -304,6 +305,8 @@ enum Error {
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Zbus(#[from] zbus::Error),
     #[error("{0}")]
     Sql(#[from] sqlx::Error),
 

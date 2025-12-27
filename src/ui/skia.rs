@@ -403,6 +403,7 @@ pub enum Svg {
     Config,
     Search,
     Bin,
+    Gps,
 }
 
 impl Svg {
@@ -414,6 +415,7 @@ impl Svg {
             Self::Config => include_bytes!("../../svgs/config.svg"),
             Self::Search => include_bytes!("../../svgs/search.svg"),
             Self::Bin => include_bytes!("../../svgs/bin.svg"),
+            Self::Gps => include_bytes!("../../svgs/gps.svg"),
         }
     }
 }

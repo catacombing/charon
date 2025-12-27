@@ -30,3 +30,26 @@ To compile Charon, the following dependencies are required:
  - kyotocabinet (runtime)
  - sqlite3 (runtime)
  - marisa (runtime)
+
+## GPS
+
+To show GPS, it first needs to enabled either through a UI of choosing or
+`mmcli`:
+
+```
+$ mmcli -m any --location-enable-gps-raw
+```
+
+The refresh rate is set by the modem, but can be increased from the default `30`
+through `mmcli`:
+
+```
+# Change GPS refresh rate from 30, to 10 seconds (this will increase battery usage).
+$ mmcli -m any --location-set-gps-refresh-rate 10
+```
+
+To allow your user to read the location from the modem, you also need to grant
+it location permissions using polkit.
+
+The rule to grant these permissions to users in the `catacomb` group can be
+found in the [rules](./rules) directory.

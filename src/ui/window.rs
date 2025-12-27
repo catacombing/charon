@@ -409,7 +409,7 @@ impl Window {
         // Ensure search reference point matches last map view position.
         if view == View::Search {
             let map_view: &mut MapView = self.views.get_mut(View::Map).unwrap();
-            let reference_point = map_view.geographic_point();
+            let reference_point = map_view.reference_point();
             let reference_zoom = map_view.zoom();
 
             let search_view: &mut SearchView = self.views.get_mut(View::Search).unwrap();

@@ -3,6 +3,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::mem;
+use std::time::Duration;
 
 use calloop::channel::{self, Event};
 use calloop::timer::{TimeoutAction, Timer};
@@ -12,6 +13,7 @@ use skia_safe::{Color4f, FilterMode, MipmapMode, Paint, Rect, SamplingOptions};
 use tracing::error;
 
 use crate::config::{Config, Input};
+use crate::dbus::modem_manager;
 use crate::geometry::{GeoPoint, Point, Size};
 use crate::tiles::{MAX_ZOOM, TILE_SIZE, TileIndex, TileIter, Tiles};
 use crate::ui::skia::RenderState;
@@ -20,37 +22,42 @@ use crate::ui::view::{UiView, View};
 use crate::ui::{Button, Svg, Velocity};
 use crate::{Error, State};
 
-/// Search button width and height at scale 1.
-const SEARCH_BUTTON_SIZE: u32 = 48;
+/// Button width and height at scale 1.
+const BUTTON_SIZE: u32 = 48;
 
-/// Padding around the search button at scale 1.
-const SEARCH_BUTTON_PADDING: u32 = 16;
+/// Padding around the buttons at scale 1.
+const BUTTON_PADDING: u32 = 16;
 
-/// Border around the search button at scale 1.
-const SEARCH_BUTTON_BORDER: f64 = 1.;
+/// Border around the buttons at scale 1.
+const BUTTON_BORDER: f64 = 1.;
 
 /// Attribution label font size relative to the default.
 const ATTRIBUTION_FONT_SIZE: f32 = 0.5;
 
-/// POI circle radius at scale 1.
-const POI_RADIUS: f32 = 5.;
+/// POI/GPS indicator width/height at scale 1.
+const INDICATOR_SIZE: f32 = 10.;
 
-/// POI border size at scale 1.
-const POI_BORDER: f32 = 2.;
+/// POI/GPS indicator border size at scale 1.
+const INDICATOR_BORDER: f32 = 4.;
+
+/// Time after losing GPS signal before GPS indicator is removed.
+const GPS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Map rendering UI view.
 pub struct MapView {
     pending_tiles: Vec<TileIndex>,
     tiles: Tiles,
-    poi_tile: Option<TileIndex>,
-    poi_offset: Option<Point>,
-    poi: Option<GeoPoint>,
+
+    gps_timeout: Option<RegistrationToken>,
+    gps: Option<RenderGeoPoint>,
+    poi: Option<RenderGeoPoint>,
 
     cursor_tile: TileIndex,
     cursor_offset: Point,
     cursor_zoom: f64,
 
     search_button: Button,
+    home_button: Button,
     tile_paint: Paint,
 
     touch_state: TouchState,
@@ -80,21 +87,25 @@ impl MapView {
                 && map_view.pending_tiles.contains(&tile_index)
             {
                 map_view.dirty = true;
-
-                if state.window.views.dirty() {
-                    state.window.unstall();
-                }
+                state.window.unstall();
             }
         })?;
         let tiles = Tiles::new(client, tile_tx, config)?;
+
+        // Listen for new GPS location updates.
+        Self::spawn_gps(&event_loop)?;
 
         // Set (0, 0) start location at a zoom level without empty space.
         let (cursor_tile, cursor_offset) = GeoPoint::new(0., 0.).tile(3);
 
         // Initialize UI elements.
         let point = Self::search_button_point(size, 1.);
-        let size = Self::search_button_size(1.);
+        let size = Self::button_size(1.);
         let search_button = Button::new(point, size, Svg::Search);
+
+        let point = Self::home_button_point(size, 1.);
+        let size = Self::button_size(1.);
+        let home_button = Button::new(point, size, Svg::Gps);
 
         let mut tile_paint = Paint::default();
         tile_paint.set_color4f(Color4f::from(config.colors.background), None);
@@ -102,6 +113,7 @@ impl MapView {
         Ok(Self {
             cursor_offset,
             search_button,
+            home_button,
             cursor_tile,
             event_loop,
             tile_paint,
@@ -113,8 +125,8 @@ impl MapView {
             pending_tiles: Default::default(),
             cursor_zoom: Default::default(),
             touch_state: Default::default(),
-            poi_offset: Default::default(),
-            poi_tile: Default::default(),
+            gps_timeout: Default::default(),
+            gps: Default::default(),
             poi: Default::default(),
         })
     }
@@ -124,9 +136,12 @@ impl MapView {
         &self.tiles
     }
 
-    /// Get the geographic location an the center of the screen.
-    pub fn geographic_point(&self) -> GeoPoint {
-        GeoPoint::from_tile(self.cursor_tile, self.cursor_offset)
+    /// Get the geographic reference point for geocoding.
+    pub fn reference_point(&self) -> GeoPoint {
+        match self.gps {
+            Some(gps) => gps.point,
+            None => GeoPoint::from_tile(self.cursor_tile, self.cursor_offset),
+        }
     }
 
     /// Get the current tile zoom level.
@@ -146,10 +161,43 @@ impl MapView {
 
     /// Highlight a specific point on the map.
     pub fn set_poi(&mut self, point: Option<GeoPoint>) {
+        let point = point.map(RenderGeoPoint::new);
         self.dirty |= self.poi != point;
-        self.poi_offset = None;
-        self.poi_tile = None;
-        self.poi = point;
+        self.poi = point
+    }
+
+    /// Update the GPS indicator location.
+    pub fn set_gps(&mut self, point: Option<GeoPoint>) {
+        let point = point.map(RenderGeoPoint::new);
+        match point {
+            Some(point) => {
+                // Cancel pending GPS removal on update.
+                if let Some(token) = self.gps_timeout.take() {
+                    self.event_loop.remove(token);
+                }
+
+                self.dirty |= self.gps != Some(point);
+                self.gps = Some(point);
+            },
+            // To avoid 'flickering' we only remove GPS after a period of inactivity.
+            None if self.gps_timeout.is_none() => {
+                let timer = Timer::from_duration(GPS_TIMEOUT);
+                let token = self.event_loop.insert_source(timer, move |_, _, state| {
+                    let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
+                    map_view.dirty |= map_view.gps.is_some();
+                    map_view.gps_timeout = None;
+                    map_view.gps = None;
+
+                    state.window.unstall();
+
+                    TimeoutAction::Drop
+                });
+                self.gps_timeout = token
+                    .inspect_err(|err| error!("Failed to stage GPS removal timeout: {err}"))
+                    .ok();
+            },
+            None => (),
+        }
     }
 
     /// Touch long-press callback.
@@ -317,10 +365,15 @@ impl MapView {
         (2f64.powf(self.cursor_zoom) * 100.).round() / 100.
     }
 
+    /// Physical size of the UI buttons.
+    fn button_size(scale: f64) -> Size {
+        Size::new(BUTTON_SIZE, BUTTON_SIZE) * scale
+    }
+
     /// Physical location of the search button.
     fn search_button_point(size: Size, scale: f64) -> Point {
-        let padding = (SEARCH_BUTTON_PADDING as f64 * scale).round() as i32;
-        let button_size = Self::search_button_size(scale);
+        let padding = (BUTTON_PADDING as f64 * scale).round() as i32;
+        let button_size = Self::button_size(scale);
         let physical_size = size * scale;
 
         let x = (physical_size.width - button_size.width) as i32 - padding;
@@ -329,9 +382,42 @@ impl MapView {
         Point::new(x, y)
     }
 
-    /// Physical size of the search button.
-    fn search_button_size(scale: f64) -> Size {
-        Size::new(SEARCH_BUTTON_SIZE, SEARCH_BUTTON_SIZE) * scale
+    /// Physical location of the GPS centering button.
+    fn home_button_point(size: Size, scale: f64) -> Point {
+        let search_button_point = Self::search_button_point(size, scale);
+        let padding = (BUTTON_PADDING as f64 * scale).round() as i32;
+        let button_size = Self::button_size(scale);
+
+        let mut point = search_button_point;
+        point.x -= button_size.width as i32 + padding;
+
+        point
+    }
+
+    /// Create the GPS location background task.
+    fn spawn_gps(event_loop: &LoopHandle<'static, State>) -> Result<(), Error> {
+        let (gps_tx, gps_rx) = channel::channel();
+
+        // Listen for new GPS location updates in the background.
+        tokio::spawn(async move {
+            if let Err(err) = modem_manager::gps_listen(gps_tx).await {
+                error!("DBus GPS error: {err}");
+            }
+        });
+
+        // Forward new GPS locations to the maps view.
+        event_loop.insert_source(gps_rx, |event, _, state| {
+            let location = match event {
+                Event::Msg(location) => location,
+                Event::Closed => return,
+            };
+
+            let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
+            map_view.set_gps(location);
+            state.window.unstall();
+        })?;
+
+        Ok(())
     }
 }
 
@@ -419,47 +505,73 @@ impl UiView for MapView {
             paragraph.paint(&render_state, Point::new(0., 0.));
         }
 
-        // Draw POI if visible.
-        if let Some(poi) = self.poi {
-            // Convert geographic point to tile index + offset and cache it.
-            let (tile, offset) = match (self.poi_tile, self.poi_offset) {
-                (Some(tile), Some(offset)) if tile.z == self.cursor_tile.z => (tile, offset),
-                _ => {
-                    let (tile, offset) = poi.tile(self.cursor_tile.z);
-                    self.poi_tile = Some(tile);
-                    self.poi_offset = Some(offset);
-                    (tile, offset)
-                },
-            };
+        let fill_size = INDICATOR_SIZE * self.scale as f32;
+        let border_size = fill_size + INDICATOR_BORDER * self.scale as f32;
 
-            if let Some(point) = iter.screen_point(tile, offset) {
-                let poi_radius = POI_RADIUS * self.scale as f32;
-                let border_radius = poi_radius + POI_BORDER * self.scale as f32;
+        // Draw POI rectangle.
+        let poi_tile = self.poi.map(|mut poi| poi.tile(self.cursor_tile.z));
+        let poi_point = poi_tile.and_then(|(tile, offset)| iter.screen_point(tile, offset));
+        if let Some(point) = poi_point {
+            // Draw circle border.
+            self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
+            let rect = Rect::new(
+                point.x as f32 - border_size / 2.,
+                point.y as f32 - border_size / 2.,
+                point.x as f32 + border_size / 2.,
+                point.y as f32 + border_size / 2.,
+            );
+            render_state.draw_rect(rect, &self.tile_paint);
 
-                self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
-                render_state.draw_circle(point, border_radius, &self.tile_paint);
-
-                self.tile_paint.set_color4f(Color4f::from(config.colors.highlight), None);
-                render_state.draw_circle(point, poi_radius, &self.tile_paint);
-            }
+            // Draw circle fill.
+            self.tile_paint.set_color4f(Color4f::from(config.colors.highlight), None);
+            let rect = Rect::new(
+                point.x as f32 - fill_size / 2.,
+                point.y as f32 - fill_size / 2.,
+                point.x as f32 + fill_size / 2.,
+                point.y as f32 + fill_size / 2.,
+            );
+            render_state.draw_rect(rect, &self.tile_paint);
         }
 
-        // Draw search button with a border to distinguish it from the map.
+        // Draw GPS circle.
+        let gps_tile = self.gps.map(|mut gps| gps.tile(self.cursor_tile.z));
+        let gps_point = gps_tile.and_then(|(tile, offset)| iter.screen_point(tile, offset));
+        if let Some(point) = gps_point {
+            // Draw circle border.
+            self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
+            render_state.draw_circle(point, border_size / 2., &self.tile_paint);
+
+            // Draw circle fill.
+            self.tile_paint.set_color4f(Color4f::from(config.colors.highlight), None);
+            render_state.draw_circle(point, fill_size / 2., &self.tile_paint);
+        }
+
+        // Draw buttons with a border to distinguish them from the map.
 
         let search_point: Point<f32> = Self::search_button_point(self.size, self.scale).into();
-        let search_size: Size<f32> = Self::search_button_size(self.scale).into();
-        let search_border = (SEARCH_BUTTON_BORDER * self.scale) as f32;
+        let home_point: Point<f32> = Self::home_button_point(self.size, self.scale).into();
+        let button_size: Size<f32> = Self::button_size(self.scale).into();
+        let button_border = (BUTTON_BORDER * self.scale) as f32;
 
-        let search_left = search_point.x - search_border;
-        let search_top = search_point.y - search_border;
-        let search_right = search_point.x + search_size.width + search_border;
-        let search_bottom = search_point.y + search_size.height + search_border;
-        let border_rect = Rect::new(search_left, search_top, search_right, search_bottom);
+        let button_points: &mut [_] = match self.gps {
+            Some(_) => {
+                &mut [(&mut self.search_button, search_point), (&mut self.home_button, home_point)]
+            },
+            None => &mut [(&mut self.search_button, search_point)],
+        };
 
-        self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
-        render_state.draw_rect(border_rect, &self.tile_paint);
+        for (button, point) in button_points {
+            let search_left = point.x - button_border;
+            let search_top = point.y - button_border;
+            let search_right = point.x + button_size.width + button_border;
+            let search_bottom = point.y + button_size.height + button_border;
+            let border_rect = Rect::new(search_left, search_top, search_right, search_bottom);
 
-        self.search_button.draw(&mut render_state, config.colors.alt_background);
+            self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
+            render_state.draw_rect(border_rect, &self.tile_paint);
+
+            button.draw(&mut render_state, config.colors.alt_background);
+        }
 
         // If no downloads are pending, pre-download tiles just outside the viewport.
         #[cfg(feature = "profiling")]
@@ -484,6 +596,7 @@ impl UiView for MapView {
 
         // Update UI elements.
         self.search_button.set_point(Self::search_button_point(size, self.scale));
+        self.home_button.set_point(Self::home_button_point(size, self.scale));
     }
 
     #[cfg_attr(feature = "profiling", profiling::function)]
@@ -493,7 +606,9 @@ impl UiView for MapView {
 
         // Update UI elements.
         self.search_button.set_point(Self::search_button_point(self.size, scale));
-        self.search_button.set_size(Self::search_button_size(scale));
+        self.search_button.set_size(Self::button_size(scale));
+        self.home_button.set_point(Self::home_button_point(self.size, scale));
+        self.home_button.set_size(Self::button_size(scale));
     }
 
     #[cfg_attr(feature = "profiling", profiling::function)]
@@ -509,6 +624,9 @@ impl UiView for MapView {
         match self.touch_state.slots.len() {
             0 if self.search_button.contains(point) => {
                 self.touch_state.action = TouchAction::Search;
+            },
+            0 if self.home_button.contains(point) => {
+                self.touch_state.action = TouchAction::Home;
             },
             0 => {
                 // Calculate delta to last tap.
@@ -602,7 +720,7 @@ impl UiView for MapView {
                 self.touch_state.velocity_zooming_in = distance > last_distance;
                 self.touch_state.zoom_velocity_distance = distance;
             },
-            TouchAction::Search | TouchAction::None => (),
+            TouchAction::Home | TouchAction::Search | TouchAction::None => (),
         }
     }
 
@@ -628,6 +746,24 @@ impl UiView for MapView {
             // Handle search button press.
             TouchAction::Search if self.search_button.contains(removed.point) => {
                 self.event_loop.insert_idle(move |state| state.window.set_view(View::Search));
+            },
+            // Handle GPS centering button press.
+            TouchAction::Home if self.home_button.contains(removed.point) => {
+                if let Some(RenderGeoPoint { point, .. }) = self.gps {
+                    let (tile, offset) = point.tile(self.cursor_tile.z);
+
+                    // Zoom in, if the GPS location is already centered.
+                    if self.cursor_offset != offset || self.cursor_tile != tile {
+                        self.cursor_offset = offset;
+                        self.cursor_tile = tile;
+                        self.dirty = true;
+                    } else if self.cursor_tile.z != MAX_ZOOM {
+                        let (tile, offset) = point.tile(MAX_ZOOM);
+                        self.cursor_offset = offset;
+                        self.cursor_tile = tile;
+                        self.dirty = true;
+                    }
+                }
             },
             _ => (),
         }
@@ -723,6 +859,28 @@ enum TouchAction {
     DoubleTap,
     Search,
     Drag,
+    Home,
     Zoom,
     Tap,
+}
+
+/// Geographic point with a tile location cache.
+#[derive(PartialEq, Copy, Clone)]
+struct RenderGeoPoint {
+    point: GeoPoint,
+    cached: Option<(TileIndex, Point)>,
+}
+
+impl RenderGeoPoint {
+    fn new(point: GeoPoint) -> Self {
+        Self { point, cached: Default::default() }
+    }
+
+    /// Get the tile index and offset for this point.
+    fn tile(&mut self, z: u8) -> (TileIndex, Point) {
+        match self.cached {
+            Some(cached) if cached.0.z == z => cached,
+            _ => *self.cached.insert(self.point.tile(z)),
+        }
+    }
 }

@@ -1,0 +1,8 @@
+polkit.addRule(function(action, subject) {
+    // Grant group `catacomb` access to get GPS location data from the modem.
+    if (action.id == "org.freedesktop.ModemManager1.Location"
+        && subject.isInGroup("catacomb"))
+    {
+        return polkit.Result.YES;
+    }
+});
