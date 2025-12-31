@@ -16,7 +16,7 @@ use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::SetOnce;
 use tokio::task::{self, JoinHandle};
 use tokio::time;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::Error;
 use crate::config::Config;
@@ -286,24 +286,26 @@ impl Tile {
         let task_download_state = download_state.clone();
         let load_task = tokio::spawn(async move {
             // Try to load the tile from the filesystem DB.
-            let db_tile = match task_download_state.fs_cache.get(index).await {
-                // Immediately return DB image if it is not outdated.
-                Ok(Some(db_tile)) if db_tile.age_secs <= MAX_FS_CACHE_TIME => {
+            match task_download_state.fs_cache.get(index).await {
+                Ok(Some(db_tile)) => {
+                    // If image is outdated, download it in the background.
+                    // We still return the outdated image to improve performance.
+                    if db_tile.age_secs > MAX_FS_CACHE_TIME {
+                        let task_download_state = task_download_state.clone();
+                        tokio::spawn(Self::download(task_download_state, index));
+                    }
+
                     // Notify renderer about new map load completion.
                     let _ = task_download_state.tile_tx.send(index);
 
                     return Ok(db_tile.image);
                 },
-                // Use DB image as download fallback if it is outdated.
-                Ok(db_tile) => db_tile,
-                Err(err) => {
-                    error!("Failed to load tile {index:?} from cache: {err}");
-                    None
-                },
-            };
+                Ok(None) => (),
+                Err(err) => error!("Failed to load tile {index:?} from cache: {err}"),
+            }
 
             // If it's not in the filesystem cache, start a new download.
-            Self::download(&task_download_state, index, db_tile).await
+            Self::download(task_download_state, index).await
         });
         let image = PendingImage::Loading(Some(load_task));
 
@@ -331,7 +333,7 @@ impl Tile {
                     let index = self.index;
                     let download_task = tokio::spawn(async move {
                         time::sleep(FAILED_DOWNLOAD_DELAY).await;
-                        Self::download(&download_state, index, None).await
+                        Self::download(download_state, index).await
                     });
                     self.image = PendingImage::Loading(Some(download_task));
                 },
@@ -346,36 +348,15 @@ impl Tile {
     }
 
     /// Load a new tile from the tileserver.
-    async fn download(
-        state: &DownloadState,
-        index: TileIndex,
-        db_tile: Option<DbTile>,
-    ) -> Result<Image, Error> {
+    async fn download(state: DownloadState, index: TileIndex) -> Result<Image, Error> {
         // Get image from tileserver.
         let url = state
             .server
             .replace("{x}", &index.x.to_string())
             .replace("{y}", &index.y.to_string())
             .replace("{z}", &index.z.to_string());
-        let send_request = async || {
-            let response = state.client.get(&url).send().await?.error_for_status()?;
-            Ok::<_, Error>(response.bytes().await?)
-        };
-        let data = send_request().await;
-
-        // Get request data, or fallback to DB tile if present and request failed.
-        let data = match (data, db_tile) {
-            (Ok(data), _) => data,
-            (Err(err), Some(db_tile)) => {
-                warn!("Download failed, using cached tile: {err}");
-
-                // Notify renderer about new map download completion.
-                let _ = state.tile_tx.send(index);
-
-                return Ok(db_tile.image);
-            },
-            (Err(err), None) => return Err(err),
-        };
+        let response = state.client.get(&url).send().await?.error_for_status()?;
+        let data = response.bytes().await?;
 
         // Add tile to filesystem cache.
         state.fs_cache.insert(index, &data).await?;
@@ -518,7 +499,7 @@ impl FsCache {
             "INSERT INTO tile (tileserver, x, y, z, data) \
                 VALUES (?, ?, ?, ?, ?) \
              ON CONFLICT DO UPDATE \
-                SET data=excluded.data",
+                SET data = excluded.data, ctime = unixepoch(), atime = unixepoch()",
         )
         .bind(&*self.tileserver)
         .bind(index.x)

@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 - Superfluous trailing comma in Photon's geocoding addresses results
+- Slow load for tiles older than 7 days
 
 ## 0.3.0
 
