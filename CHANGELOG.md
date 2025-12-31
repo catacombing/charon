@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - ModemManager GPS support
 
+### Fixed
+
+- Superfluous trailing comma in Photon's geocoding addresses results
+
 ## 0.3.0
 
 ### Added

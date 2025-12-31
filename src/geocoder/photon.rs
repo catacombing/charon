@@ -226,6 +226,12 @@ impl PhotonProperties {
             address.push_str(country);
             address.push_str(", ");
         }
+
+        // Truncate trailing comma.
+        if !address.is_empty() {
+            address.truncate(address.len() - 2);
+        }
+
         address
     }
 }
