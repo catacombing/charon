@@ -19,8 +19,6 @@ use crate::config::Config;
 use crate::geometry::{Point, Size};
 use crate::ui::renderer::Renderer;
 use crate::ui::skia::Canvas;
-use crate::ui::view::map::MapView;
-use crate::ui::view::search::SearchView;
 use crate::ui::view::{View, Views};
 use crate::wayland::ProtocolStates;
 use crate::{Error, State};
@@ -406,14 +404,18 @@ impl Window {
         // Notify view about getting opened.
         self.views.enter();
 
-        // Ensure search reference point matches last map view position.
         if view == View::Search {
-            let map_view: &mut MapView = self.views.get_mut(View::Map).unwrap();
+            let map_view = self.views.map();
             let reference_point = map_view.reference_point();
+            let route_active = map_view.route_active();
             let reference_zoom = map_view.zoom();
 
-            let search_view: &mut SearchView = self.views.get_mut(View::Search).unwrap();
+            // Ensure search reference point matches last map view position.
+            let search_view = self.views.search();
             search_view.set_reference(reference_point, reference_zoom);
+
+            // Ensure search route status matches map state.
+            search_view.set_route_active(route_active);
         }
 
         self.text_input_dirty = true;

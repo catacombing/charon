@@ -160,9 +160,19 @@ impl Views {
         self.active_view = view;
     }
 
-    /// Get mutable access to a view.
-    pub fn get_mut<T: 'static>(&mut self, view: View) -> Option<&mut T> {
-        self.views[view as usize].as_any().downcast_mut()
+    /// Get mutable access to the download view.
+    pub fn download(&mut self) -> &mut DownloadView {
+        self.views[View::Download as usize].as_any().downcast_mut().unwrap()
+    }
+
+    /// Get mutable access to the search view.
+    pub fn search(&mut self) -> &mut SearchView {
+        self.views[View::Search as usize].as_any().downcast_mut().unwrap()
+    }
+
+    /// Get mutable access to the map view.
+    pub fn map(&mut self) -> &mut MapView {
+        self.views[View::Map as usize].as_any().downcast_mut().unwrap()
     }
 
     /// Get the active view.

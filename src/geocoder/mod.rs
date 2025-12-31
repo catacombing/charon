@@ -1,7 +1,6 @@
 //! Geocoding abstraction layer.
 
 use std::cmp::Ordering;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, mpsc};
 
 use calloop::channel::Event;
@@ -12,8 +11,7 @@ use reqwest::Client;
 use crate::config::Config;
 use crate::geometry::GeoPoint;
 use crate::region::Regions;
-use crate::ui::view::View;
-use crate::ui::view::search::SearchView;
+use crate::ui::view::search::QueryId;
 use crate::{Error, State};
 
 mod geojson;
@@ -46,7 +44,7 @@ impl Geocoder {
 
         // Handle new geocoding results.
         event_loop.insert_source(result_rx, |event, _, state| {
-            let search_view: &mut SearchView = state.window.views.get_mut(View::Search).unwrap();
+            let search_view = state.window.views.search();
             let geocoder = search_view.geocoder_mut();
 
             let query_event = match event {
@@ -74,7 +72,12 @@ impl Geocoder {
                 QueryResultEvent::NlpDone => geocoder.nlp_searching = false,
             }
 
-            search_view.update_results();
+            // Notify user about geocoding failure.
+            if !geocoder.searching() && geocoder.results.is_empty() {
+                search_view.set_error("No Entity Found");
+            }
+
+            search_view.set_dirty();
             state.window.unstall();
         })?;
 
@@ -110,6 +113,14 @@ impl Geocoder {
     /// Submit a reverse geocoding query.
     pub fn reverse(&mut self, query: ReverseQuery) {
         self.query(QueryEvent::Reverse(query));
+    }
+
+    /// Clear the current search.
+    pub fn reset(&mut self) {
+        self.last_query = QueryId::new();
+        self.photon_searching = false;
+        self.nlp_searching = false;
+        self.results.clear();
     }
 
     /// Get current query results.
@@ -253,15 +264,4 @@ pub enum QueryResultRank {
     Nlp(f64),
     /// Photon result rank, lower is better.
     Photon(usize),
-}
-
-/// Unique ID of a search query.
-#[derive(PartialEq, Eq, Copy, Clone)]
-pub struct QueryId(u64);
-
-impl QueryId {
-    fn new() -> Self {
-        static NEXT_QUERY_ID: AtomicU64 = AtomicU64::new(0);
-        Self(NEXT_QUERY_ID.fetch_add(1, AtomicOrdering::Relaxed))
-    }
 }

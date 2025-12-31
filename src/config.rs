@@ -149,11 +149,18 @@ pub struct Search {
     ///
     /// An empty URL will disable online geocoding.
     pub photon_url: Arc<String>,
+    /// URL base of the Valhalla routing server.
+    ///
+    /// An empty URL will disable online routing.
+    pub valhalla_url: Arc<String>,
 }
 
 impl Default for Search {
     fn default() -> Self {
-        Self { photon_url: Arc::new("https://photon.komoot.io".into()) }
+        Self {
+            valhalla_url: Arc::new("https://valhalla1.openstreetmap.de".into()),
+            photon_url: Arc::new("https://photon.komoot.io".into()),
+        }
     }
 }
 

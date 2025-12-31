@@ -398,10 +398,12 @@ pub struct GlConfig {
 /// Available SVG images.
 #[derive(Hash, PartialEq, Eq, Copy, Clone, Debug)]
 pub enum Svg {
+    CancelRoute,
     ArrowLeft,
     Download,
     Config,
     Search,
+    Route,
     Bin,
     Gps,
 }
@@ -410,10 +412,12 @@ impl Svg {
     /// Get SVG's text content.
     const fn content(&self) -> &'static [u8] {
         match self {
+            Self::CancelRoute => include_bytes!("../../svgs/cancel_route.svg"),
             Self::ArrowLeft => include_bytes!("../../svgs/arrow_left.svg"),
             Self::Download => include_bytes!("../../svgs/download.svg"),
             Self::Config => include_bytes!("../../svgs/config.svg"),
             Self::Search => include_bytes!("../../svgs/search.svg"),
+            Self::Route => include_bytes!("../../svgs/route.svg"),
             Self::Bin => include_bytes!("../../svgs/bin.svg"),
             Self::Gps => include_bytes!("../../svgs/gps.svg"),
         }

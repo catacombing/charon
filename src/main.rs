@@ -24,8 +24,6 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 use crate::config::{Config, ConfigEventHandler};
-use crate::ui::view::View;
-use crate::ui::view::map::MapView;
 use crate::ui::window::Window;
 use crate::wayland::{ProtocolStates, TextInput};
 
@@ -35,6 +33,7 @@ mod entity_type;
 mod geocoder;
 mod geometry;
 mod region;
+mod router;
 mod tiles;
 mod ui;
 mod wayland;
@@ -84,8 +83,7 @@ async fn run() -> Result<(), Error> {
     }
 
     // Ensure database is cleanly terminated.
-    let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
-    map_view.tiles().fs_cache().close().await;
+    state.window.views.map().tiles().fs_cache().close().await;
 
     Ok(())
 }

@@ -11,9 +11,10 @@ use tracing::{error, info};
 use crate::config::Config;
 use crate::geocoder::geojson::{Feature, GeoJson, Geometry};
 use crate::geocoder::{
-    QueryEvent, QueryId, QueryResult, QueryResultEvent, QueryResultRank, ReverseQuery, SearchQuery,
+    QueryEvent, QueryResult, QueryResultEvent, QueryResultRank, ReverseQuery, SearchQuery,
 };
 use crate::geometry::GeoPoint;
+use crate::ui::view::search::QueryId;
 use crate::{Error, entity_type};
 
 /// Maximum results returned by one Photon query.
@@ -44,7 +45,7 @@ impl Geocoder {
 
     /// Listen for new search queries.
     async fn listen(&mut self) {
-        info!("Starting Photon Geocoder ({})", self.url);
+        info!("Starting Photon geocoder ({})", self.url);
 
         let entity_types = entity_type::entity_types();
 
@@ -67,7 +68,7 @@ impl Geocoder {
             let _ = self.result_tx.send((id, QueryResultEvent::PhotonDone));
         }
 
-        info!("Shutting down Photon Geocoder ({})", self.url);
+        info!("Shutting down Photon geocoder ({})", self.url);
     }
 
     /// Process a geocoding search query.

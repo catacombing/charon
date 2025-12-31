@@ -207,14 +207,7 @@ impl TileIter {
     /// The supplied `tile_index` must have a `z` coordinate matching the
     /// iterator's `z` coordinate.
     pub fn screen_point(&self, tile_index: TileIndex, offset: Point) -> Option<Point> {
-        let x_delta = tile_index.x.checked_sub(self.tile_index.x)? as i32;
-        let y_delta = tile_index.y.checked_sub(self.tile_index.y)? as i32;
-
-        // Apply fractional scale to tile offset.
-        let mut point = self.origin + offset * self.scale;
-
-        point.x += x_delta * self.tile_size;
-        point.y += y_delta * self.tile_size;
+        let point = self.tile_point(tile_index, offset);
 
         // Check whether point is visible.
         if point.x < 0
@@ -226,6 +219,25 @@ impl TileIter {
         } else {
             Some(point)
         }
+    }
+
+    /// Get physical position of a map point in screen coordinates.
+    ///
+    /// The supplied `tile_index` must have a `z` coordinate matching the
+    /// iterator's `z` coordinate.
+    pub fn tile_point(&self, tile_index: TileIndex, offset: Point) -> Point {
+        debug_assert_eq!(tile_index.z, self.tile_index.z);
+
+        let x_delta = tile_index.x as i32 - self.tile_index.x as i32;
+        let y_delta = tile_index.y as i32 - self.tile_index.y as i32;
+
+        // Apply fractional scale to tile offset.
+        let mut point = self.origin + offset * self.scale;
+
+        point.x += x_delta * self.tile_size;
+        point.y += y_delta * self.tile_size;
+
+        point
     }
 
     /// Target width and height of the tile.

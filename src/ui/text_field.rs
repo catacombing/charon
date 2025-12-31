@@ -18,8 +18,6 @@ use crate::config::{Config, Input as InputConfig};
 use crate::geometry::{Point, Size};
 use crate::ui::rect_contains;
 use crate::ui::skia::{RenderState, TextOptions};
-use crate::ui::view::View;
-use crate::ui::view::search::SearchView;
 
 /// Maximum number of surrounding bytes submitted to IME.
 ///
@@ -77,7 +75,6 @@ impl TextField {
     ) -> Self {
         let mut paint = Paint::default();
         paint.set_stroke_width(CARET_STROKE as f32);
-        paint.set_anti_alias(true);
 
         Self {
             event_loop,
@@ -422,9 +419,7 @@ impl TextField {
             (Keysym::Return, false, false) => {
                 // Submit current search.
                 self.event_loop.insert_idle(move |state| {
-                    let search_view: &mut SearchView =
-                        state.window.views.get_mut(View::Search).unwrap();
-                    search_view.submit_search();
+                    state.window.views.search().submit_search();
                     state.window.unstall();
                 });
             },

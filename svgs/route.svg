@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32">
+  <marker
+     id="arrow"
+     overflow="visible"
+     orient="auto-start-reverse"
+     refX="0"
+     refY="0"
+     markerWidth="0.4"
+     markerHeight="0.5"
+     viewBox="0 0 1 1"
+     preserveAspectRatio="none">
+    <path
+       d="M 2.885,0 -1.44,2.5 v -5 z"
+       fill="context-stroke"
+       fill-rule="evenodd"
+       stroke="context-stroke"
+       stroke-width="0.5pt"
+    />
+  </marker>
+  <path
+     d="m 22.84086,26.077693 v -16 h -10"
+     marker-end="url(#arrow)"
+     stroke="#ffffff"
+     stroke-width="4"
+     stroke-linecap="square"
+     fill-opacity="0"
+  />
+</svg>

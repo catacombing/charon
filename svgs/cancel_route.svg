@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32">
+  <marker
+     id="arrow"
+     overflow="visible"
+     orient="auto-start-reverse"
+     refX="0"
+     refY="0"
+     markerWidth="0.4"
+     markerHeight="0.5"
+     viewBox="0 0 1 1"
+     preserveAspectRatio="none">
+    <path
+       d="M 2.885,0 -1.44,2.5 v -5 z"
+       fill="context-stroke"
+       fill-rule="evenodd"
+       stroke="context-stroke"
+       stroke-width="0.5pt"
+    />
+  </marker>
+  <mask maskUnits="userSpaceOnUse" id="strikeout-mask">
+    <path d="M 6.1591403,2.9223079 H 25.84086 V 29.077693 H 6.1591403 Z" fill="#ffffff" />
+    <path d="M 26.364525,3.922308 7.1591403,23.127695 12.10914,28.077693 31.314525,8.872308 Z" fill="#000000" />
+  </mask>
+  <path
+     d="m 22.84086,26.077693 v -16 h -10"
+     transform="translate(-3.2368327)"
+     marker-end="url(#arrow)"
+     mask="url(#strikeout-mask)"
+     stroke="#ffffff"
+     stroke-width="4"
+     stroke-linecap="square"
+     fill-opacity="0"
+  />
+  <path d="m 3.9223076,25.249693 2.8279999,2.828 21.3273845,-21.327385 -2.827999,-2.828 z" fill="#ffffff" />
+</svg>

@@ -3,9 +3,16 @@
 use std::f64::consts::PI;
 use std::ops::{Add, AddAssign, Div, Mul, Sub, SubAssign};
 
+use serde::Serialize;
 use skia_safe::{ISize, Point as SkiaPoint};
 
-use crate::tiles::{TILE_SIZE, TileIndex};
+use crate::tiles::{MAX_ZOOM, TILE_SIZE, TileIndex};
+
+/// Earth's circumference at the equator in meters.
+const EARTH_EQUATOR: f64 = 40_075_016.686;
+
+/// Width and height of a single pixel in meters at zoom level 0.
+const ZERO_PIXEL_SIZE: f64 = EARTH_EQUATOR / TILE_SIZE as f64;
 
 /// 2D object position.
 #[derive(PartialEq, Eq, Copy, Clone, Default, Debug)]
@@ -222,7 +229,7 @@ impl<T: Sub<Output = T>> Sub<Size<T>> for Size<T> {
 }
 
 /// Point in geographical space.
-#[derive(PartialEq, Default, Copy, Clone, Debug)]
+#[derive(Serialize, PartialEq, Default, Copy, Clone, Debug)]
 pub struct GeoPoint {
     pub lat: f64,
     pub lon: f64,
@@ -301,12 +308,70 @@ where
         && point.y < rect_point.y + rect_size.height
 }
 
+/// Check if any point of a line lies within a rectangle.
+pub fn rect_intersects_line(
+    rect_point: Point<f64>,
+    rect_size: Size<f64>,
+    line_start: Point<f64>,
+    line_end: Point<f64>,
+) -> bool {
+    let max_point = rect_point + Point::new(rect_size.width, rect_size.height);
+
+    // Handle case where entire line lies within the rectangle.
+    rect_contains(rect_point, rect_size, line_start)
+        // Check all four sides for intersection with the line.
+        || lines_intersect(rect_point, Point::new(max_point.x, rect_point.y), line_start, line_end)
+        || lines_intersect(rect_point, Point::new(rect_point.x, max_point.y), line_start, line_end)
+        || lines_intersect(Point::new(max_point.x, rect_point.y), max_point, line_start, line_end)
+        || lines_intersect(Point::new(rect_point.x, max_point.y), max_point, line_start, line_end)
+}
+
+/// Check if two lines intersect
+fn lines_intersect(
+    a_start: Point<f64>,
+    a_end: Point<f64>,
+    b_start: Point<f64>,
+    b_end: Point<f64>,
+) -> bool {
+    let a_width = a_end.x - a_start.x;
+    let a_height = a_end.y - a_start.y;
+    let b_width = b_end.x - b_start.x;
+    let b_height = b_end.y - b_start.y;
+
+    // Check if lines are parallel.
+    let det = a_width * b_height - b_width * a_height;
+    if det == 0. {
+        // Check if parallel lines intersect.
+        return line_contains(a_start, a_end, b_start)
+            || line_contains(a_start, a_end, b_end)
+            || line_contains(b_start, b_end, a_start);
+    }
+
+    // Calculate intersection.
+    let idet = 1. / det;
+    let s = (-a_height * (a_start.x - b_start.x) + a_width * (a_start.y - b_start.y)) * idet;
+    let t = (b_width * (a_start.y - b_start.y) - b_height * (a_start.x - b_start.x)) * idet;
+
+    (0. ..=1.).contains(&s) && (0. ..=1.).contains(&t)
+}
+
+/// Check if a line contains a point.
+fn line_contains(line_start: Point<f64>, line_end: Point<f64>, point: Point<f64>) -> bool {
+    point.x <= line_start.x.max(line_end.x)
+        && point.x >= line_start.x.min(line_end.x)
+        && point.y <= line_start.y.max(line_end.y)
+        && point.y >= line_start.y.min(line_end.y)
+}
+
 /// Get pixel size in meters for a certain zoom level and latitude.
 pub fn pixel_size(lat: f64, zoom: u8) -> f64 {
-    const EARTH_EQUATOR: f64 = 40_075_016.686;
-    const ZERO_PIXEL_SIZE: f64 = EARTH_EQUATOR / TILE_SIZE as f64;
-
     ZERO_PIXEL_SIZE * lat.to_radians().cos() / 2f64.powi(zoom as i32)
+}
+
+/// Get zoom level at which a distance in meters fits into a fixed pixel size.
+pub fn zoom_for_distance(lat: f64, meters: f64, pixels: f64) -> u8 {
+    let zoom = (ZERO_PIXEL_SIZE * lat.to_radians().cos() * pixels / meters).ln() / 2f64.ln();
+    zoom.clamp(0., MAX_ZOOM as f64).floor() as u8
 }
 
 #[cfg(test)]
@@ -365,5 +430,59 @@ mod tests {
             assert_eq!(pixel_size(lat, 9), 305.7481131439209 * lat.to_radians().cos());
             assert_eq!(pixel_size(lat, 18), 0.5971642834842205 * lat.to_radians().cos());
         }
+    }
+
+    #[test]
+    fn rect_intersection() {
+        let rect_point = Point::new(0., 0.);
+        let rect_size = Size::new(10., 10.);
+
+        let line_start = Point::new(3., 3.);
+        let line_end = Point::new(5., 5.);
+        assert!(rect_intersects_line(rect_point, rect_size, line_start, line_end));
+
+        let line_start = Point::new(0., 3.);
+        let line_end = Point::new(0., 5.);
+        assert!(rect_intersects_line(rect_point, rect_size, line_start, line_end));
+
+        let line_start = Point::new(3., 10.);
+        let line_end = Point::new(5., 10.);
+        assert!(rect_intersects_line(rect_point, rect_size, line_start, line_end));
+
+        let line_start = Point::new(-5., 3.);
+        let line_end = Point::new(15., 3.);
+        assert!(rect_intersects_line(rect_point, rect_size, line_start, line_end));
+
+        let line_start = Point::new(3., -5.);
+        let line_end = Point::new(3., 15.);
+        assert!(rect_intersects_line(rect_point, rect_size, line_start, line_end));
+
+        let line_start = Point::new(-2., 5.);
+        let line_end = Point::new(5., 12.);
+        assert!(rect_intersects_line(rect_point, rect_size, line_start, line_end));
+
+        let line_start = Point::new(-2., -1.);
+        let line_end = Point::new(12., -1.);
+        assert!(!rect_intersects_line(rect_point, rect_size, line_start, line_end));
+
+        let line_start = Point::new(12., -2.);
+        let line_end = Point::new(12., 12.);
+        assert!(!rect_intersects_line(rect_point, rect_size, line_start, line_end));
+
+        let line_start = Point::new(-2., 1.);
+        let line_end = Point::new(1., -2.);
+        assert!(!rect_intersects_line(rect_point, rect_size, line_start, line_end));
+    }
+
+    #[test]
+    fn required_zoom() {
+        assert_eq!(zoom_for_distance(0., 0.6, 1.), 17);
+        assert_eq!(zoom_for_distance(0., 152., 1.), 10);
+        assert_eq!(zoom_for_distance(0., 152., 1.), 10);
+
+        assert_eq!(zoom_for_distance(0., 119.44, 100.), 16);
+        assert_eq!(zoom_for_distance(0., 119.43, 100.), 17);
+
+        assert_eq!(zoom_for_distance(80., 53., 2.), 10);
     }
 }

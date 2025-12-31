@@ -51,6 +51,7 @@ This section documents the `[search]` table.
 |Name|Description|Type|Default|
 |-|-|-|-|
 |photon_url|URL base of the Photon geocoding server.<br><br>An empty URL will disable online geocoding.|text|`"https://photon.komoot.io"`|
+|valhalla_url|URL base of the Valhalla routing server.<br><br>An empty URL will disable online routing.|text|`"https://valhalla1.openstreetmap.de"`|
 
 ### input
 

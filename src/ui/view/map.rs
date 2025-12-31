@@ -9,15 +9,17 @@ use calloop::channel::{self, Event};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{LoopHandle, RegistrationToken};
 use reqwest::Client;
-use skia_safe::{Color4f, FilterMode, MipmapMode, Paint, Rect, SamplingOptions};
+use skia_safe::{
+    Color4f, FilterMode, MipmapMode, Paint, PaintCap, PaintJoin, PathBuilder, Rect, SamplingOptions,
+};
 use tracing::error;
 
 use crate::config::{Config, Input};
 use crate::dbus::modem_manager;
-use crate::geometry::{GeoPoint, Point, Size};
+use crate::geometry::{self, GeoPoint, Point, Size, rect_intersects_line};
+use crate::router::Route;
 use crate::tiles::{MAX_ZOOM, TILE_SIZE, TileIndex, TileIter, Tiles};
 use crate::ui::skia::RenderState;
-use crate::ui::view::search::SearchView;
 use crate::ui::view::{UiView, View};
 use crate::ui::{Button, Svg, Velocity};
 use crate::{Error, State};
@@ -43,6 +45,15 @@ const INDICATOR_BORDER: f32 = 4.;
 /// Time after losing GPS signal before GPS indicator is removed.
 const GPS_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Width of the route path at scale 1 and max zoom.
+const ROUTE_WIDTH: f32 = 10.;
+
+/// Square of the minimum physical distance between a route's path segments.
+const ROUTE_RESOLUTION: f64 = 15.;
+
+/// Percentage of route width used to center the map.
+const ROUTE_ZOOM_PADDING: f64 = 1.1;
+
 /// Map rendering UI view.
 pub struct MapView {
     pending_tiles: Vec<TileIndex>,
@@ -51,6 +62,7 @@ pub struct MapView {
     gps_timeout: Option<RegistrationToken>,
     gps: Option<RenderGeoPoint>,
     poi: Option<RenderGeoPoint>,
+    route: Option<Vec<RenderGeoPoint>>,
 
     cursor_tile: TileIndex,
     cursor_offset: Point,
@@ -58,6 +70,7 @@ pub struct MapView {
 
     search_button: Button,
     home_button: Button,
+    route_paint: Paint,
     tile_paint: Paint,
 
     touch_state: TouchState,
@@ -82,7 +95,7 @@ impl MapView {
         // Initialize the tile cache.
         let (tile_tx, tile_rx) = channel::channel();
         event_loop.insert_source(tile_rx, |event, _, state| {
-            let map_view: &mut Self = state.window.views.get_mut(View::Map).unwrap();
+            let map_view = state.window.views.map();
             if let Event::Msg(tile_index) = event
                 && map_view.pending_tiles.contains(&tile_index)
             {
@@ -110,11 +123,22 @@ impl MapView {
         let mut tile_paint = Paint::default();
         tile_paint.set_color4f(Color4f::from(config.colors.background), None);
 
+        // XXX: We intentionally set anti-aliasing to FALSE, since it kills performance.
+        // With 69 elements, `draw_path` time increased from ~0.3ms to 10+ms.
+        let mut route_paint = Paint::default();
+        route_paint.set_color4f(Color4f::from(config.colors.highlight), None);
+        route_paint.set_stroke_join(PaintJoin::Bevel);
+        route_paint.set_stroke_cap(PaintCap::Round);
+        route_paint.set_stroke_width(ROUTE_WIDTH);
+        route_paint.set_anti_alias(false);
+        route_paint.set_stroke(true);
+
         Ok(Self {
             cursor_offset,
             search_button,
-            home_button,
             cursor_tile,
+            home_button,
+            route_paint,
             event_loop,
             tile_paint,
             tiles,
@@ -126,6 +150,7 @@ impl MapView {
             cursor_zoom: Default::default(),
             touch_state: Default::default(),
             gps_timeout: Default::default(),
+            route: Default::default(),
             gps: Default::default(),
             poi: Default::default(),
         })
@@ -161,14 +186,23 @@ impl MapView {
 
     /// Highlight a specific point on the map.
     pub fn set_poi(&mut self, point: Option<GeoPoint>) {
-        let point = point.map(RenderGeoPoint::new);
-        self.dirty |= self.poi != point;
-        self.poi = point
+        let point = point.map(RenderGeoPoint::from);
+        if self.poi == point {
+            return;
+        }
+
+        // Clear route when a new POI is set.
+        if point.is_some() {
+            self.cancel_route();
+        }
+
+        self.dirty = true;
+        self.poi = point;
     }
 
     /// Update the GPS indicator location.
     pub fn set_gps(&mut self, point: Option<GeoPoint>) {
-        let point = point.map(RenderGeoPoint::new);
+        let point = point.map(RenderGeoPoint::from);
         match point {
             Some(point) => {
                 // Cancel pending GPS removal on update.
@@ -183,7 +217,7 @@ impl MapView {
             None if self.gps_timeout.is_none() => {
                 let timer = Timer::from_duration(GPS_TIMEOUT);
                 let token = self.event_loop.insert_source(timer, move |_, _, state| {
-                    let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
+                    let map_view = state.window.views.map();
                     map_view.dirty |= map_view.gps.is_some();
                     map_view.gps_timeout = None;
                     map_view.gps = None;
@@ -198,6 +232,36 @@ impl MapView {
             },
             None => (),
         }
+    }
+
+    /// Update the active route.
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    pub fn set_route(&mut self, route: Route) {
+        let points = route
+            .segments
+            .into_iter()
+            .flat_map(|segment| segment.points.into_iter().map(RenderGeoPoint::from))
+            .collect();
+        self.route = Some(points);
+
+        // Set viewport to show the entire route.
+        self.center_route();
+
+        // Clear POIs, since they're either part of the route or a distraction.
+        self.poi = None;
+
+        self.dirty = true;
+    }
+
+    /// Clear the active route.
+    pub fn cancel_route(&mut self) {
+        self.dirty |= self.route.is_some();
+        self.route = None;
+    }
+
+    /// Check whether a route is currently present.
+    pub fn route_active(&self) -> bool {
+        self.route.is_some()
     }
 
     /// Touch long-press callback.
@@ -220,8 +284,7 @@ impl MapView {
 
         // Submit query and open search view.
         self.event_loop.insert_idle(move |state| {
-            let search_view: &mut SearchView = state.window.views.get_mut(View::Search).unwrap();
-            search_view.reverse(geo_point, tile_index.z);
+            state.window.views.search().reverse(geo_point, tile_index.z);
             state.window.set_view(View::Search);
         });
     }
@@ -394,6 +457,50 @@ impl MapView {
         point
     }
 
+    /// Set tile index and offset to give an overview over the current route.
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn center_route(&mut self) {
+        // Get geographical start and end point of the route.
+        //
+        // While in theory the start and end might not be the furthest point apart from
+        // each other, this should work in most scenarios and avoids having to
+        // determine maximum bounds for all points in the route.
+        let (start, end) = match self.route.as_ref().and_then(|r| Some((r.first()?, r.last()?))) {
+            Some((start, end)) => (start.point, end.point),
+            None => return,
+        };
+
+        // Calculate center point of the route.
+        let center_lat = (start.lat + end.lat) / 2.;
+        let center_lon = (start.lon + end.lon) / 2.;
+        let center = GeoPoint::new(center_lat, center_lon);
+
+        // Calculate maximum dimensions (in meters) of the route.
+        //
+        // We use the minimum latitude for width calculation since circumference gets
+        // bigger when closer to the equator (lat 0), which gives us the maximum
+        // required distance.
+        let min_lat = start.lat.min(end.lat);
+        let width = GeoPoint::new(min_lat, start.lon).distance(GeoPoint::new(min_lat, end.lon));
+        let height = GeoPoint::new(start.lat, 0.).distance(GeoPoint::new(end.lat, 0.));
+
+        // Add tolerance to ensure route doesn't 'bump' into screen borders.
+        let width = width as f64 * ROUTE_ZOOM_PADDING;
+        let height = height as f64 * ROUTE_ZOOM_PADDING;
+
+        // Calculate required zoom level.
+        //
+        // We use the maximum latitude for zoom level since pixels are most stretched at
+        // the poles (lat 90), so we need to zoom out more when closer to the poles.
+        let max_lat = start.lat.max(end.lat);
+        let size: Size<f64> = (self.size * self.scale).into();
+        let width_zoom = geometry::zoom_for_distance(max_lat, width, size.width);
+        let height_zoom = geometry::zoom_for_distance(max_lat, height, size.height);
+        let zoom = width_zoom.min(height_zoom);
+
+        self.goto(center, zoom);
+    }
+
     /// Create the GPS location background task.
     fn spawn_gps(event_loop: &LoopHandle<'static, State>) -> Result<(), Error> {
         let (gps_tx, gps_rx) = channel::channel();
@@ -412,8 +519,9 @@ impl MapView {
                 Event::Closed => return,
             };
 
-            let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
-            map_view.set_gps(location);
+            state.window.views.search().set_gps(location);
+            state.window.views.map().set_gps(location);
+
             state.window.unstall();
         })?;
 
@@ -546,6 +654,50 @@ impl UiView for MapView {
             render_state.draw_circle(point, fill_size / 2., &self.tile_paint);
         }
 
+        // Draw current route segments.
+        if let Some(route) = &mut self.route {
+            #[cfg(feature = "profiling")]
+            profiling::scope!("draw_route");
+
+            // Ensure route color is up to date.
+            self.route_paint.set_color4f(Color4f::from(config.colors.highlight), None);
+
+            let mut path = PathBuilder::new();
+            let mut skipped = true;
+            let mut omitted = 0;
+
+            // Add path segments for all visible route sections.
+            let size: Size<f64> = size.into();
+            for i in 1..route.len() {
+                let (start_tile, start_offset) = route[i - omitted - 1].tile(self.cursor_tile.z);
+                let start_point = iter.tile_point(start_tile, start_offset).into();
+
+                let (end_tile, end_offset) = route[i].tile(self.cursor_tile.z);
+                let end_point = iter.tile_point(end_tile, end_offset).into();
+
+                let delta: Point<f64> = start_point - end_point;
+
+                if i + 1 < route.len() && delta.x.hypot(delta.y) < ROUTE_RESOLUTION {
+                    // If a point is too close to the last one, omit it.
+                    omitted += 1;
+                } else if rect_intersects_line(Point::default(), size, start_point, end_point) {
+                    // Draw visible route segments.
+                    if mem::take(&mut skipped) {
+                        path.move_to(start_point);
+                    }
+                    path.line_to(end_point);
+                    omitted = 0;
+                } else {
+                    // Skip invisible segments, breaking the path.
+                    skipped = true;
+                    omitted = 0;
+                }
+            }
+
+            // Draw the entire path.
+            render_state.draw_path(&path.detach(), &self.route_paint);
+        }
+
         // Draw buttons with a border to distinguish them from the map.
 
         let search_point: Point<f32> = Self::search_button_point(self.size, self.scale).into();
@@ -609,6 +761,7 @@ impl UiView for MapView {
         self.search_button.set_size(Self::button_size(scale));
         self.home_button.set_point(Self::home_button_point(self.size, scale));
         self.home_button.set_size(Self::button_size(scale));
+        self.route_paint.set_stroke_width(ROUTE_WIDTH * scale as f32);
     }
 
     #[cfg_attr(feature = "profiling", profiling::function)]
@@ -826,7 +979,7 @@ impl TouchState {
         // Stage new callback.
         let timer = Timer::from_duration(*input_config.long_press);
         let token = event_loop.insert_source(timer, move |_, _, state| {
-            let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
+            let map_view = state.window.views.map();
             map_view.trigger_long_press(point);
             TimeoutAction::Drop
         });
@@ -872,15 +1025,17 @@ struct RenderGeoPoint {
 }
 
 impl RenderGeoPoint {
-    fn new(point: GeoPoint) -> Self {
-        Self { point, cached: Default::default() }
-    }
-
     /// Get the tile index and offset for this point.
     fn tile(&mut self, z: u8) -> (TileIndex, Point) {
         match self.cached {
             Some(cached) if cached.0.z == z => cached,
             _ => *self.cached.insert(self.point.tile(z)),
         }
+    }
+}
+
+impl From<GeoPoint> for RenderGeoPoint {
+    fn from(point: GeoPoint) -> Self {
+        Self { point, cached: Default::default() }
     }
 }

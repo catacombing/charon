@@ -10,10 +10,11 @@ use geocoder_nlp::{Geocoder as GeocoderNlp, SearchIter};
 use tracing::{error, info, warn};
 
 use crate::geocoder::{
-    QueryEvent, QueryId, QueryResult, QueryResultEvent, QueryResultRank, ReverseQuery, SearchQuery,
+    QueryEvent, QueryResult, QueryResultEvent, QueryResultRank, ReverseQuery, SearchQuery,
 };
 use crate::geometry::{self, GeoPoint};
 use crate::region::{Region, Regions};
+use crate::ui::view::search::QueryId;
 use crate::{Error, entity_type};
 
 /// Search radius in pixels for reverse geocoding.
@@ -51,7 +52,7 @@ impl Geocoder {
 
     /// Listen for new search queries.
     fn listen(&mut self) {
-        info!("Starting Geocoder NLP");
+        info!("Starting NLP geocoder");
 
         let postal_global_path = self.regions.postal_global_path();
         let entity_types = entity_type::entity_types();
@@ -71,7 +72,7 @@ impl Geocoder {
             let _ = self.result_tx.send((id, QueryResultEvent::NlpDone));
         }
 
-        info!("Shutting down Geocoder NLP");
+        info!("Shutting down NLP geocoder");
     }
 
     /// Process a geocoding search query.

@@ -17,8 +17,6 @@ use tempfile::NamedTempFile;
 use tokio::task::JoinSet;
 use tracing::{debug, error, warn};
 
-use crate::ui::view::View;
-use crate::ui::view::download::DownloadView;
 use crate::{Error, State};
 
 /// Pre-parsed region data.
@@ -67,7 +65,7 @@ impl Regions {
         // Register ping source to allow waking up UI on async region state changes.
         let (ui_waker, source) = ping::make_ping()?;
         event_loop.insert_source(source, |_, _, state| {
-            state.window.views.get_mut::<DownloadView>(View::Download).unwrap().set_dirty();
+            state.window.views.download().set_dirty();
             state.window.unstall();
         })?;
 

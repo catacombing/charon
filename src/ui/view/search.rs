@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::mem;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use calloop::LoopHandle;
 use reqwest::Client;
@@ -17,9 +18,10 @@ use crate::config::{Config, Input};
 use crate::geocoder::{Geocoder, QueryResult, ReverseQuery, SearchQuery};
 use crate::geometry::{GeoPoint, Point, Size};
 use crate::region::Regions;
+use crate::router::{Router, RoutingQuery};
 use crate::ui::skia::{RenderState, TextOptions};
-use crate::ui::view::{MapView, UiView, View};
-use crate::ui::{Button, Svg, TextField, Velocity};
+use crate::ui::view::{UiView, View};
+use crate::ui::{Button, Svg, TextField, Velocity, rect_contains};
 use crate::{Error, State};
 
 /// Padding around the screen edge at scale 1.
@@ -37,6 +39,9 @@ const RESULTS_Y_PADDING: f64 = 2.;
 /// Region entry height at scale 1.
 const RESULTS_HEIGHT: u32 = 100;
 
+/// Size of the routing button inside geocoding search results at scale 1.
+const ROUTING_BUTTON_SIZE: u32 = 32;
+
 /// Padding between text inside the result entries at scale 1.
 const TEXT_PADDING: f64 = 3.;
 
@@ -51,16 +56,24 @@ pub struct SearchView {
     event_loop: LoopHandle<'static, State>,
 
     geocoder: Geocoder,
+    router: Router,
+
     last_query: String,
     reference_point: GeoPoint,
     reference_zoom: u8,
     pending_reverse: bool,
+    route_origin: Option<GeoPoint>,
+    route_active: bool,
+    gps: Option<GeoPoint>,
 
+    cancel_route_button: Button,
     search_field: TextField,
     config_button: Button,
     search_button: Button,
     back_button: Button,
+    gps_button: Button,
     bg_paint: Paint,
+    error: &'static str,
 
     touch_state: TouchState,
     input_config: Input,
@@ -85,7 +98,8 @@ impl SearchView {
         regions: Arc<Regions>,
         size: Size,
     ) -> Result<Self, Error> {
-        let geocoder = Geocoder::new(event_loop.clone(), config, client, regions)?;
+        let geocoder = Geocoder::new(event_loop.clone(), config, client.clone(), regions)?;
+        let router = Router::new(event_loop.clone(), config, client)?;
 
         // Initialize UI elements.
 
@@ -102,19 +116,28 @@ impl SearchView {
         let point = Self::config_button_point(size, 1.);
         let config_button = Button::new(point, button_size, Svg::Config);
 
+        let point = Self::gps_button_point(size, 1.);
+        let gps_button = Button::new(point, button_size, Svg::Gps);
+
+        let point = Self::cancel_route_button_point(size, 1.);
+        let cancel_route_button = Button::new(point, button_size, Svg::CancelRoute);
+
         let search_size = Self::search_field_size(size, 1.);
         let point = Self::search_field_point(size, 1.);
         let mut search_field = TextField::new(event_loop.clone(), point, search_size, 1.);
         search_field.set_placeholder("Search…");
 
         Ok(Self {
+            cancel_route_button,
             config_button,
             search_button,
             search_field,
             back_button,
             event_loop,
+            gps_button,
             bg_paint,
             geocoder,
+            router,
             size,
             input_config: config.input,
             search_focused: true,
@@ -128,6 +151,10 @@ impl SearchView {
             ime_focused: Default::default(),
             touch_state: Default::default(),
             last_query: Default::default(),
+            route_origin: Default::default(),
+            route_active: Default::default(),
+            error: Default::default(),
+            gps: Default::default(),
         })
     }
 
@@ -136,9 +163,32 @@ impl SearchView {
         &mut self.geocoder
     }
 
-    /// Mark geocoding search results as dirty.
-    pub fn update_results(&mut self) {
+    /// Get mutable access to the routing engine.
+    pub fn router_mut(&mut self) -> &mut Router {
+        &mut self.router
+    }
+
+    /// Mark view for a redraw.
+    pub fn set_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    /// Update the search reference point.
+    pub fn set_reference(&mut self, point: GeoPoint, zoom: u8) {
+        self.reference_point = point;
+        self.reference_zoom = zoom;
+    }
+
+    /// Update the current GPS location.
+    pub fn set_gps(&mut self, point: Option<GeoPoint>) {
+        self.dirty |= self.gps != point;
+        self.gps = point;
+    }
+
+    /// Set an error message indicating that an operation has failed.
+    pub fn set_error(&mut self, error: &'static str) {
+        self.dirty |= self.error != error;
+        self.error = error;
     }
 
     /// Submit current search field text for geocoding.
@@ -146,16 +196,18 @@ impl SearchView {
         self.last_query = self.search_field.text().to_owned();
         self.dirty = true;
 
-        // Submit background query.
-        let mut query = SearchQuery::new(&self.last_query);
-        query.set_reference(self.reference_point, self.reference_zoom);
-        self.geocoder.search(query);
+        if self.last_query.trim().is_empty() {
+            // Reset search without query.
+            self.geocoder.reset();
+        } else {
+            // Submit background query.
+            let mut query = SearchQuery::new(&self.last_query);
+            query.set_reference(self.reference_point, self.reference_zoom);
+            self.geocoder.search(query);
+        }
 
         // Clear current POI map marker.
-        self.event_loop.insert_idle(move |state| {
-            let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
-            map_view.set_poi(None);
-        });
+        self.event_loop.insert_idle(move |state| state.window.views.map().set_poi(None));
     }
 
     /// Run reverse geocoding search.
@@ -171,15 +223,35 @@ impl SearchView {
         self.search_field.set_text("");
     }
 
-    /// Update the search reference point.
-    pub fn set_reference(&mut self, point: GeoPoint, zoom: u8) {
-        self.reference_point = point;
-        self.reference_zoom = zoom;
+    /// Set whether a route is currently available for cancellation.
+    pub fn set_route_active(&mut self, active: bool) {
+        self.dirty |= self.route_active != active;
+        self.route_active = active;
     }
 
-    /// Draw a search result entry.
+    /// Start a new route calculation.
+    fn route(&mut self, origin: GeoPoint, target: GeoPoint) {
+        self.search_field.set_text("");
+        self.route_origin = None;
+        self.dirty = true;
+
+        self.geocoder.reset();
+
+        // Submit background query.
+        self.router.route(RoutingQuery::new(origin, target));
+    }
+
+    /// Set origin for routing and start route target selection.
+    fn set_route_origin(&mut self, origin: GeoPoint) {
+        self.route_origin = Some(origin);
+        self.search_field.set_text("");
+        self.geocoder.reset();
+        self.dirty = true;
+    }
+
+    /// Draw a geocoding search result entry.
     #[cfg_attr(feature = "profiling", profiling::function)]
-    fn draw_result<'a>(
+    fn draw_geocoding_result<'a>(
         &self,
         config: &Config,
         render_state: &mut RenderState<'a>,
@@ -188,7 +260,10 @@ impl SearchView {
         result: &QueryResult,
     ) {
         let padding = (RESULTS_INSIDE_PADDING * self.scale).round() as f32;
-        let text_width = size.width as f32 - padding * 2.;
+        let mut routing_button_point = self.routing_button_point();
+        let routing_button_size = self.routing_button_size();
+
+        let text_width = routing_button_point.x as f32 - padding * 2.;
         let mut text_point = point;
         text_point.x += padding as i32;
 
@@ -253,6 +328,10 @@ impl SearchView {
         text_point.y += entity_text_height + text_padding;
 
         address_paragraph.paint(render_state, text_point);
+
+        // Draw routing button.
+        routing_button_point += point;
+        render_state.draw_svg(Svg::Route, routing_button_point, routing_button_size);
     }
 
     /// Physical location of the search text field.
@@ -312,6 +391,28 @@ impl SearchView {
         Point::new(x, y)
     }
 
+    /// Physical location of the GPS location button.
+    fn gps_button_point(size: Size, scale: f64) -> Point {
+        let config_button_point = Self::config_button_point(size, scale);
+        let padding = (OUTSIDE_PADDING as f64 * scale).round() as i32;
+        let button_size = Self::button_size(scale);
+
+        let x = config_button_point.x - button_size.width as i32 - padding;
+
+        Point::new(x, config_button_point.y)
+    }
+
+    /// Physical location of the route cancellation button.
+    fn cancel_route_button_point(size: Size, scale: f64) -> Point {
+        let config_button_point = Self::config_button_point(size, scale);
+        let padding = (OUTSIDE_PADDING as f64 * scale).round() as i32;
+        let button_size = Self::button_size(scale);
+
+        let y = config_button_point.y - button_size.height as i32 - padding;
+
+        Point::new(config_button_point.x, y)
+    }
+
     /// Physical size of the back/search buttons.
     fn button_size(scale: f64) -> Size {
         Size::new(BUTTON_SIZE, BUTTON_SIZE) * scale
@@ -340,8 +441,40 @@ impl SearchView {
         Size::new(width, height)
     }
 
+    /// Physical point of the routing button relative to the result origin.
+    fn routing_button_point(&self) -> Point {
+        let padding = (RESULTS_INSIDE_PADDING * self.scale).round() as i32;
+        let button_size = self.routing_button_size();
+        let result_size = self.result_size();
+
+        let x = (result_size.width - button_size.width) as i32 - padding;
+        let y = (result_size.height - button_size.height) as i32 / 2;
+
+        Point::new(x, y)
+    }
+
+    /// Physical size of the routing button.
+    fn routing_button_size(&self) -> Size {
+        Size::new(ROUTING_BUTTON_SIZE, ROUTING_BUTTON_SIZE) * self.scale
+    }
+
+    /// Get current search results.
+    fn results(&self) -> &[QueryResult] {
+        if self.router.routing() { &[] } else { self.geocoder.results() }
+    }
+
+    /// Check whether the config/gps buttons should be rendered.
+    fn show_extra_buttons(&self) -> bool {
+        self.results().is_empty() && !self.geocoder.searching() && !self.router.routing()
+    }
+
+    /// Check whether the route cancellation button should be rendered.
+    fn show_cancel_route_button(&self) -> bool {
+        self.show_extra_buttons() && (self.route_origin.is_some() || self.route_active)
+    }
+
     /// Get result at the specified location.
-    fn result_at(&self, mut point: Point<f64>) -> Option<&QueryResult> {
+    fn result_at(&self, mut point: Point<f64>) -> Option<(&QueryResult, bool)> {
         let result_point = self.result_point();
         let result_size = self.result_size();
         let results_end = result_point.y as f64 + result_size.height as f64;
@@ -365,10 +498,19 @@ impl SearchView {
         }
 
         // Find index at the specified offset.
-        let results = self.geocoder.results();
         let index = (bottom_relative / results_height).floor() as usize;
+        let result = self.results().get(index)?;
 
-        results.get(index)
+        // Check whether the tap is within the result's button.
+        let relative_x = point.x - result_point.x as f64;
+        let relative_y = results_height - 1. - (bottom_relative % results_height);
+        let relative_point = Point::new(relative_x, relative_y);
+        let routing_button_point: Point<f64> = self.routing_button_point().into();
+        let routing_button_size: Size<f64> = self.routing_button_size().into();
+        let button_pressed =
+            rect_contains(routing_button_point, routing_button_size, relative_point);
+
+        Some((result, button_pressed))
     }
 
     /// Clamp viewport offset.
@@ -391,7 +533,7 @@ impl SearchView {
         let result_height = self.result_size().height as usize;
 
         // Calculate height of all results plus top padding.
-        let results_count = self.geocoder.results().len();
+        let results_count = self.results().len();
         let results_height = (results_count * (result_height + results_padding))
             .saturating_sub(results_padding)
             + outside_padding;
@@ -441,7 +583,7 @@ impl UiView for SearchView {
         render_state.clip_rect(clip_rect, None, Some(false));
 
         // Draw query results.
-        let results = self.geocoder.results();
+        let results = self.results();
         for result in results {
             if result_point.y > results_start.y + (result_size.height as i32) {
                 result_point.y -= result_size.height as i32 + padding;
@@ -450,7 +592,13 @@ impl UiView for SearchView {
                 break;
             }
 
-            self.draw_result(config, &mut render_state, result_point, result_size, result);
+            self.draw_geocoding_result(
+                config,
+                &mut render_state,
+                result_point,
+                result_size,
+                result,
+            );
             result_point.y -= result_size.height as i32 + padding;
         }
 
@@ -459,10 +607,14 @@ impl UiView for SearchView {
 
         // Draw current search status indicator.
         if results.is_empty() {
-            let msg = if self.geocoder.searching() {
-                Cow::Owned(format!("Searching for \"{}\" …", self.last_query))
-            } else {
-                Cow::Borrowed("No Results")
+            let msg = match (self.route_origin, self.geocoder.searching(), self.router.routing()) {
+                (_, _, true) => Cow::Borrowed("Calculating Route …"),
+                (_, true, _) => Cow::Owned(format!("Searching for \"{}\" …", self.last_query)),
+                (Some(_), ..) => Cow::Borrowed("Enter Destination"),
+                (None, false, false) if self.error.is_empty() => {
+                    Cow::Borrowed("Search for an Address or POI")
+                },
+                (None, false, false) => Cow::Borrowed(self.error),
             };
 
             let options = TextOptions::new().ellipsize(false).align(TextAlign::Center);
@@ -474,18 +626,25 @@ impl UiView for SearchView {
             builder.add_text(msg);
 
             let mut paragraph = builder.build();
-            paragraph.layout(size.width as f32);
+            let outside_padding = (OUTSIDE_PADDING as f64 * self.scale).round();
+            paragraph.layout(size.width as f32 - outside_padding as f32);
 
             let result_end = results_start.y as f32 + result_size.height as f32;
             let y = (result_end - paragraph.height()) / 2.;
             paragraph.paint(&render_state, Point::new(0., y));
         }
 
-        // Render search text field.
+        // Render input elements.
+
         self.search_field.draw(config, &mut render_state, config.colors.alt_background);
 
-        // Render navigation button.
-        if results.is_empty() && !self.geocoder.searching() {
+        if self.show_extra_buttons() {
+            if self.show_cancel_route_button() {
+                self.cancel_route_button.draw(&mut render_state, config.colors.alt_background);
+            }
+            if self.gps.is_some() {
+                self.gps_button.draw(&mut render_state, config.colors.alt_background);
+            }
             self.config_button.draw(&mut render_state, config.colors.alt_background);
         }
         self.search_button.draw(&mut render_state, config.colors.alt_background);
@@ -497,6 +656,8 @@ impl UiView for SearchView {
     }
 
     fn enter(&mut self) {
+        self.error = "";
+
         // Focus input on enter, unless view was opened for reverse geocoding.
         if mem::take(&mut self.pending_reverse) {
             self.search_field.set_keyboard_focus(false);
@@ -516,11 +677,11 @@ impl UiView for SearchView {
 
         // Update UI elements.
 
+        self.cancel_route_button.set_point(Self::cancel_route_button_point(size, self.scale));
         self.config_button.set_point(Self::config_button_point(size, self.scale));
-
         self.search_button.set_point(Self::search_button_point(size, self.scale));
-
         self.back_button.set_point(Self::back_button_point(size, self.scale));
+        self.gps_button.set_point(Self::gps_button_point(size, self.scale));
 
         self.search_field.set_point(Self::search_field_point(size, self.scale));
         self.search_field.set_size(Self::search_field_size(size, self.scale));
@@ -533,18 +694,26 @@ impl UiView for SearchView {
 
         // Update UI elements.
 
+        let button_size = Self::button_size(scale);
+
+        self.cancel_route_button.set_point(Self::cancel_route_button_point(self.size, scale));
+        self.cancel_route_button.set_size(button_size);
+
         self.config_button.set_point(Self::config_button_point(self.size, scale));
-        self.config_button.set_size(Self::button_size(scale));
+        self.config_button.set_size(button_size);
 
         self.search_button.set_point(Self::search_button_point(self.size, scale));
-        self.search_button.set_size(Self::button_size(scale));
+        self.search_button.set_size(button_size);
 
         self.back_button.set_point(Self::back_button_point(self.size, scale));
-        self.back_button.set_size(Self::button_size(scale));
+        self.back_button.set_size(button_size);
+
+        self.gps_button.set_point(Self::gps_button_point(self.size, scale));
+        self.gps_button.set_size(button_size);
 
         self.search_field.set_point(Self::search_field_point(self.size, scale));
-        self.search_field.set_size(Self::search_field_size(self.size, scale));
         self.search_field.set_scale_factor(scale);
+        self.search_field.set_size(button_size);
     }
 
     #[cfg_attr(feature = "profiling", profiling::function)]
@@ -570,10 +739,15 @@ impl UiView for SearchView {
         }
 
         // Determine goal of this touch sequence.
+        let show_extra_buttons = self.show_extra_buttons();
         self.touch_state.action = if self.search_focused {
             self.search_field.touch_down(&self.input_config, time, point);
             TouchAction::SearchField
-        } else if self.config_button.contains(point) {
+        } else if self.show_cancel_route_button() && self.cancel_route_button.contains(point) {
+            TouchAction::CancelRoute
+        } else if show_extra_buttons && self.gps.is_some() && self.gps_button.contains(point) {
+            TouchAction::RouteGps
+        } else if show_extra_buttons && self.config_button.contains(point) {
             TouchAction::Config
         } else if self.search_button.contains(point) {
             TouchAction::Search
@@ -637,20 +811,44 @@ impl UiView for SearchView {
 
         // Dispatch tap actions on release.
         match self.touch_state.action {
-            TouchAction::Tap => {
-                if let Some(&QueryResult { point, ref address, .. }) = self.result_at(removed.point)
-                {
+            TouchAction::Tap => match self.result_at(removed.point) {
+                Some((&QueryResult { point, ref address, .. }, false)) => {
                     let zoom = zoom_from_address(address);
                     self.event_loop.insert_idle(move |state| {
-                        let map_view: &mut MapView = state.window.views.get_mut(View::Map).unwrap();
+                        let map_view = state.window.views.map();
                         map_view.goto(point, zoom);
                         map_view.set_poi(Some(point));
                         state.window.set_view(View::Map);
                     });
-                }
+                },
+                Some((&QueryResult { point, .. }, true)) => match self.route_origin {
+                    Some(origin) => self.route(origin, point),
+                    None => self.set_route_origin(point),
+                },
+                None => (),
             },
-            TouchAction::Config if self.config_button.contains(removed.point) => {
+            TouchAction::Config
+                if self.show_extra_buttons() && self.config_button.contains(removed.point) =>
+            {
                 self.event_loop.insert_idle(|state| state.window.set_view(View::Download));
+            },
+            TouchAction::CancelRoute
+                if self.show_cancel_route_button()
+                    && self.cancel_route_button.contains(removed.point) =>
+            {
+                self.event_loop.insert_idle(|state| state.window.views.map().cancel_route());
+                self.route_active = false;
+                self.route_origin = None;
+                self.dirty = true;
+            },
+            TouchAction::RouteGps
+                if self.show_extra_buttons() && self.gps_button.contains(removed.point) =>
+            {
+                match (self.gps, self.route_origin) {
+                    (Some(gps), Some(origin)) => self.route(origin, gps),
+                    (Some(gps), None) => self.set_route_origin(gps),
+                    (None, _) => (),
+                }
             },
             TouchAction::Search if self.search_button.contains(removed.point) => {
                 self.submit_search()
@@ -735,6 +933,7 @@ impl UiView for SearchView {
     #[cfg_attr(feature = "profiling", profiling::function)]
     fn update_config(&mut self, config: &Config) {
         self.geocoder.update_config(config);
+        self.router.update_config(config);
 
         if self.input_config != config.input {
             self.input_config = config.input;
@@ -744,6 +943,17 @@ impl UiView for SearchView {
 
     fn as_any(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+/// Unique ID of a search query.
+#[derive(PartialEq, Eq, Copy, Clone)]
+pub struct QueryId(u64);
+
+impl QueryId {
+    pub fn new() -> Self {
+        static NEXT_QUERY_ID: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -767,6 +977,8 @@ struct TouchSlot {
 #[derive(PartialEq, Eq, Default)]
 enum TouchAction {
     SearchField,
+    CancelRoute,
+    RouteGps,
     Search,
     Config,
     Back,
