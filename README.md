@@ -17,6 +17,22 @@
   <img src="https://github.com/user-attachments/assets/e81b74fe-bb86-40b8-bdbc-a5d75f38c7d5" width="30%"/>
 </p>
 
+## Features
+
+The following noteworthy features are currently supported:
+
+ - Raster tile maps (partially offline, tiles need to be manually loaded once)
+ - POI / Address search (fully offline)
+ - List POIs/Addresses at location (fully offline)
+ - Routing (online only)
+ - ModemManager GPS integration
+
+The following features are **not** supported yet, but are on the roadmap:
+
+ - Bulk tile download for offline rendering
+ - Offline Valhalla routing
+ - Turn-by-turn navigation (voice instructions might be out of scope)
+
 ## Building from Source
 
 Charon is compiled with cargo, which creates a binary at `target/release/charon`:
