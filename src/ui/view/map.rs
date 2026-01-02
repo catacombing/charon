@@ -30,8 +30,11 @@ const BUTTON_SIZE: u32 = 48;
 /// Padding around the buttons at scale 1.
 const BUTTON_PADDING: u32 = 16;
 
-/// Border around the buttons at scale 1.
+/// Border size around the buttons at scale 1.
 const BUTTON_BORDER: f64 = 1.;
+
+/// Border size around the locked GPS button at scale 1.
+const LOCKED_GPS_BORDER: f64 = 4.;
 
 /// Attribution label font size relative to the default.
 const ATTRIBUTION_FONT_SIZE: f32 = 0.5;
@@ -67,9 +70,10 @@ pub struct MapView {
     cursor_tile: TileIndex,
     cursor_offset: Point,
     cursor_zoom: f64,
+    gps_locked: bool,
 
     search_button: Button,
-    home_button: Button,
+    gps_button: Button,
     route_paint: Paint,
     tile_paint: Paint,
 
@@ -116,9 +120,9 @@ impl MapView {
         let size = Self::button_size(1.);
         let search_button = Button::new(point, size, Svg::Search);
 
-        let point = Self::home_button_point(size, 1.);
+        let point = Self::gps_button_point(size, 1.);
         let size = Self::button_size(1.);
-        let home_button = Button::new(point, size, Svg::Gps);
+        let gps_button = Button::new(point, size, Svg::Gps);
 
         let mut tile_paint = Paint::default();
         tile_paint.set_color4f(Color4f::from(config.colors.background), None);
@@ -137,9 +141,9 @@ impl MapView {
             cursor_offset,
             search_button,
             cursor_tile,
-            home_button,
             route_paint,
             event_loop,
+            gps_button,
             tile_paint,
             tiles,
             size,
@@ -150,6 +154,7 @@ impl MapView {
             cursor_zoom: Default::default(),
             touch_state: Default::default(),
             gps_timeout: Default::default(),
+            gps_locked: Default::default(),
             route: Default::default(),
             gps: Default::default(),
             poi: Default::default(),
@@ -180,6 +185,7 @@ impl MapView {
         if self.cursor_tile != cursor_tile || self.cursor_offset != cursor_offset {
             self.cursor_tile = cursor_tile;
             self.cursor_offset = cursor_offset;
+            self.gps_locked = false;
             self.dirty = true;
         }
     }
@@ -210,6 +216,12 @@ impl MapView {
                     self.event_loop.remove(token);
                 }
 
+                // Jump to new GPS position if the view is locked to the GPS.
+                if self.gps_locked {
+                    self.goto(point.point, self.cursor_tile.z);
+                    self.gps_locked = true;
+                }
+
                 self.dirty |= self.gps != Some(point);
                 self.gps = Some(point);
             },
@@ -220,6 +232,7 @@ impl MapView {
                     let map_view = state.window.views.map();
                     map_view.dirty |= map_view.gps.is_some();
                     map_view.gps_timeout = None;
+                    map_view.gps_locked = false;
                     map_view.gps = None;
 
                     state.window.unstall();
@@ -299,6 +312,7 @@ impl MapView {
         self.cursor_tile = tile;
         self.cursor_offset = offset;
 
+        self.gps_locked = false;
         self.dirty = true;
     }
 
@@ -346,6 +360,16 @@ impl MapView {
         let map_delta = (1. / zoom).log2() - self.cursor_zoom;
         let map_delta_trunc = map_delta.trunc() as i32;
 
+        let size = self.size * self.scale;
+        let center = Point::new(size.width as f64, size.height as f64) / 2.;
+
+        // Always use screen center (GPS location) as zoom focus while locked.
+        let zoom_focus = if self.gps_locked && self.gps.is_some() {
+            center
+        } else {
+            self.touch_state.zoom_focus
+        };
+
         // Calculate offset required to keep zoom focus stationary.
         //
         // Rounding and precision here means the focus point isn't kept precisely in the
@@ -354,9 +378,7 @@ impl MapView {
         // The rounding is required to avoid insignificant negative changes being
         // floored to integer cursor_offset changes and causing the map to move around
         // when moving the zoom points without changing their distance.
-        let size = self.size * self.scale;
-        let center = Point::new(size.width as f64, size.height as f64) / 2.;
-        let focus_delta = self.touch_state.zoom_focus - center;
+        let focus_delta = zoom_focus - center;
         let mut focus_offset = focus_delta / self.zoom_scale() * (zoom - 1.);
         focus_offset.x = focus_offset.x.round();
         focus_offset.y = focus_offset.y.round();
@@ -446,7 +468,7 @@ impl MapView {
     }
 
     /// Physical location of the GPS centering button.
-    fn home_button_point(size: Size, scale: f64) -> Point {
+    fn gps_button_point(size: Size, scale: f64) -> Point {
         let search_button_point = Self::search_button_point(size, scale);
         let padding = (BUTTON_PADDING as f64 * scale).round() as i32;
         let button_size = Self::button_size(scale);
@@ -701,25 +723,36 @@ impl UiView for MapView {
         // Draw buttons with a border to distinguish them from the map.
 
         let search_point: Point<f32> = Self::search_button_point(self.size, self.scale).into();
-        let home_point: Point<f32> = Self::home_button_point(self.size, self.scale).into();
+        let gps_point: Point<f32> = Self::gps_button_point(self.size, self.scale).into();
         let button_size: Size<f32> = Self::button_size(self.scale).into();
-        let button_border = (BUTTON_BORDER * self.scale) as f32;
+        let button_border = (BUTTON_BORDER * self.scale).round() as f32;
 
         let button_points: &mut [_] = match self.gps {
-            Some(_) => {
-                &mut [(&mut self.search_button, search_point), (&mut self.home_button, home_point)]
+            Some(_) if self.gps_locked => {
+                let gps_border = (LOCKED_GPS_BORDER * self.scale).round() as f32;
+                let bg = config.colors.background;
+                let search = (&mut self.search_button, search_point, button_border, bg);
+                let gps = (&mut self.gps_button, gps_point, gps_border, config.colors.highlight);
+                &mut [search, gps]
             },
-            None => &mut [(&mut self.search_button, search_point)],
+            Some(_) => &mut [
+                (&mut self.search_button, search_point, button_border, config.colors.background),
+                (&mut self.gps_button, gps_point, button_border, config.colors.background),
+            ],
+            None => {
+                let bg = config.colors.background;
+                &mut [(&mut self.search_button, search_point, button_border, bg)]
+            },
         };
 
-        for (button, point) in button_points {
-            let search_left = point.x - button_border;
-            let search_top = point.y - button_border;
-            let search_right = point.x + button_size.width + button_border;
-            let search_bottom = point.y + button_size.height + button_border;
+        for (button, point, border_size, border_color) in button_points {
+            let search_left = point.x - *border_size;
+            let search_top = point.y - *border_size;
+            let search_right = point.x + button_size.width + *border_size;
+            let search_bottom = point.y + button_size.height + *border_size;
             let border_rect = Rect::new(search_left, search_top, search_right, search_bottom);
 
-            self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
+            self.tile_paint.set_color4f(Color4f::from(*border_color), None);
             render_state.draw_rect(border_rect, &self.tile_paint);
 
             button.draw(&mut render_state, config.colors.alt_background);
@@ -748,7 +781,7 @@ impl UiView for MapView {
 
         // Update UI elements.
         self.search_button.set_point(Self::search_button_point(size, self.scale));
-        self.home_button.set_point(Self::home_button_point(size, self.scale));
+        self.gps_button.set_point(Self::gps_button_point(size, self.scale));
     }
 
     #[cfg_attr(feature = "profiling", profiling::function)]
@@ -759,8 +792,8 @@ impl UiView for MapView {
         // Update UI elements.
         self.search_button.set_point(Self::search_button_point(self.size, scale));
         self.search_button.set_size(Self::button_size(scale));
-        self.home_button.set_point(Self::home_button_point(self.size, scale));
-        self.home_button.set_size(Self::button_size(scale));
+        self.gps_button.set_point(Self::gps_button_point(self.size, scale));
+        self.gps_button.set_size(Self::button_size(scale));
         self.route_paint.set_stroke_width(ROUTE_WIDTH * scale as f32);
     }
 
@@ -778,8 +811,8 @@ impl UiView for MapView {
             0 if self.search_button.contains(point) => {
                 self.touch_state.action = TouchAction::Search;
             },
-            0 if self.home_button.contains(point) => {
-                self.touch_state.action = TouchAction::Home;
+            0 if self.gps_button.contains(point) => {
+                self.touch_state.action = TouchAction::Gps;
             },
             0 => {
                 // Calculate delta to last tap.
@@ -873,7 +906,7 @@ impl UiView for MapView {
                 self.touch_state.velocity_zooming_in = distance > last_distance;
                 self.touch_state.zoom_velocity_distance = distance;
             },
-            TouchAction::Home | TouchAction::Search | TouchAction::None => (),
+            TouchAction::Gps | TouchAction::Search | TouchAction::None => (),
         }
     }
 
@@ -901,11 +934,12 @@ impl UiView for MapView {
                 self.event_loop.insert_idle(move |state| state.window.set_view(View::Search));
             },
             // Handle GPS centering button press.
-            TouchAction::Home if self.home_button.contains(removed.point) => {
+            TouchAction::Gps if self.gps_button.contains(removed.point) => {
                 if let Some(RenderGeoPoint { point, .. }) = self.gps {
                     let (tile, offset) = point.tile(self.cursor_tile.z);
 
                     // Zoom in, if the GPS location is already centered.
+                    // Toggle GPS lock if the map is already zoomed in.
                     if self.cursor_offset != offset || self.cursor_tile != tile {
                         self.cursor_offset = offset;
                         self.cursor_tile = tile;
@@ -914,6 +948,9 @@ impl UiView for MapView {
                         let (tile, offset) = point.tile(MAX_ZOOM);
                         self.cursor_offset = offset;
                         self.cursor_tile = tile;
+                        self.dirty = true;
+                    } else {
+                        self.gps_locked = !self.gps_locked;
                         self.dirty = true;
                     }
                 }
@@ -1012,8 +1049,8 @@ enum TouchAction {
     DoubleTap,
     Search,
     Drag,
-    Home,
     Zoom,
+    Gps,
     Tap,
 }
 
