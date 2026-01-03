@@ -69,3 +69,25 @@ it location permissions using polkit.
 
 The rule to grant these permissions to users in the `catacomb` group can be
 found in the [rules](./rules) directory.
+
+## Honorable Mentions
+
+Writing an application that displays map, geocoding, and routing data is the
+easy part, but it takes a lot of effort to create and compile this data.
+
+OpenStreetMap is used in some form by the majority of navigation software, so if
+you have some time please consider [contributing][osm contributing].
+
+In addition to OpenStreetMap, the following non-exhaustive list of projects and
+services have been essential in Charon's creation:
+
+ - [modRana] hosting data for offline routing and geocoding
+ - [OSM Scout Server] creating the blueprint for offline routing and geocoding
+ - [Komoot] providing the online (reverse) geocoding
+ - [Valhalla] used for offline and online routing
+
+[OSM Scout Server]: https://github.com/rinigus/osmscout-server
+[osm contributing]: https://www.openstreetmap.org/fixthemap
+[Valhalla]: https://github.com/valhalla/valhalla
+[Komoot]: https://photon.komoot.io
+[modRana]: https://modrana.org
