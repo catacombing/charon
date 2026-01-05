@@ -20,7 +20,9 @@ jobs:
             libkyotocabinet-dev \
             libmarisa-dev sqlite3 \
             libpango1.0-dev \
-            libpulse-dev
+            libprotobuf-dev \
+            libpulse-dev \
+            protobuf-compiler
       - uses: actions/checkout@v2
         with:
           submodules: 'recursive'
