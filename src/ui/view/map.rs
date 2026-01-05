@@ -628,8 +628,8 @@ impl UiView for MapView {
 
         // Render attribution message.
         if !config.tiles.attribution.is_empty() {
-            let bg = config.colors.background;
-            let mut builder = render_state.paragraph(bg, ATTRIBUTION_FONT_SIZE, None);
+            let fg = config.colors.foreground;
+            let mut builder = render_state.paragraph(fg, ATTRIBUTION_FONT_SIZE, None);
             builder.add_text(&*config.tiles.attribution);
 
             let mut paragraph = builder.build();
