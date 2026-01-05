@@ -5,6 +5,8 @@ use std::ops::{Add, AddAssign, Div, Mul, Sub, SubAssign};
 
 use serde::Serialize;
 use skia_safe::{ISize, Point as SkiaPoint};
+use valhalla::LatLon;
+use valhalla::proto::Location;
 
 use crate::tiles::{MAX_ZOOM, TILE_SIZE, TileIndex};
 
@@ -294,6 +296,13 @@ impl GeoPoint {
             + slat.cos() * olat.cos() * (delta_lon / 2.).sin().powi(2);
         let c = 2. * a.sqrt().atan2((1. - a).sqrt());
         (EARTH_RADIUS * c).round() as u32
+    }
+}
+
+impl From<GeoPoint> for Location {
+    fn from(point: GeoPoint) -> Self {
+        let latlon = LatLon(point.lat, point.lon);
+        Location { ll: latlon.into(), ..Default::default() }
     }
 }
 

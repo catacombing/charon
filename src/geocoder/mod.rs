@@ -137,6 +137,9 @@ impl Geocoder {
     pub fn update_config(&mut self, config: &Config) {
         // Restart Photon geocoder on URL change.
         if config.search.photon_url != self.photon_url {
+            // Drop old router first, to improve log order.
+            self.photon_query_tx = None;
+
             self.photon_url = config.search.photon_url.clone();
             self.photon_query_tx = (!config.search.photon_url.is_empty()).then(|| {
                 let (photon_query_tx, photon_query_rx) = mpsc::channel::<QueryEvent>();

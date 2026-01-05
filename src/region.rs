@@ -1,7 +1,8 @@
 //! Geographic region management.
 
 use std::fs;
-use std::io::Write;
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -13,10 +14,13 @@ use indexmap::IndexMap;
 use reqwest::Client;
 use reqwest::header::CONTENT_LENGTH;
 use serde::Deserialize;
+use sqlx::QueryBuilder;
+use tar::{Archive, Entry};
 use tempfile::NamedTempFile;
 use tokio::task::JoinSet;
 use tracing::{debug, error, warn};
 
+use crate::db::Db;
 use crate::{Error, State};
 
 /// Pre-parsed region data.
@@ -45,21 +49,29 @@ pub struct Regions {
     data: RegionData,
 
     geocoder_cache_dir: PathBuf,
+    valhalla_cache_dir: PathBuf,
     postal_cache_dir: PathBuf,
 
+    router_reloader: Ping,
     ui_waker: Ping,
     client: Client,
+    db: Db,
 }
 
 impl Regions {
     #[cfg_attr(feature = "profiling", profiling::function)]
-    pub fn new(event_loop: LoopHandle<'static, State>, client: Client) -> Result<Self, Error> {
+    pub fn new(
+        event_loop: LoopHandle<'static, State>,
+        client: Client,
+        db: Db,
+    ) -> Result<Arc<Self>, Error> {
         // Deserialize region data generated at compile time.
         let data = RegionData::new()?;
 
         // Get cache storage locations.
         let cache_dir = dirs::cache_dir().ok_or(Error::MissingCacheDir)?.join("charon");
         let geocoder_cache_dir = cache_dir.join("geocoder");
+        let valhalla_cache_dir = cache_dir.join("valhalla");
         let postal_cache_dir = cache_dir.join("postal");
 
         // Register ping source to allow waking up UI on async region state changes.
@@ -69,10 +81,33 @@ impl Regions {
             state.window.unstall();
         })?;
 
-        let regions = Self { geocoder_cache_dir, postal_cache_dir, ui_waker, client, data };
+        // Register ping source to allow restarting Valhalla offline geocoder.
+        let (router_reloader, source) = ping::make_ping()?;
+        event_loop.insert_source(source, |_, _, state| {
+            state.window.views.search().router_mut().reload_offline_router();
+        })?;
+
+        let regions = Arc::new(Self {
+            geocoder_cache_dir,
+            valhalla_cache_dir,
+            postal_cache_dir,
+            router_reloader,
+            ui_waker,
+            client,
+            data,
+            db,
+        });
 
         // Update region's download state from FS.
-        regions.refresh_download_state();
+        let init_regions = regions.clone();
+        tokio::spawn(async move {
+            init_regions.refresh_download_state().await;
+
+            // Start initial Valhalla offline router.
+            if init_regions.world().has_valhalla_tiles() {
+                init_regions.router_reloader.ping();
+            }
+        });
 
         Ok(regions)
     }
@@ -85,8 +120,7 @@ impl Regions {
     /// Download a region's data to the local cache.
     pub async fn download(&self, region: &Region) -> Result<(), Error> {
         let mut downloads: JoinSet<Result<_, Error>> = JoinSet::new();
-        let tracker = region.download_tracker();
-        tracker.reset();
+        let tracker = region.download_tracker(self.ui_waker.clone());
 
         // Download geocoder files.
         if let Some((geocoder_path, region_name)) = region.geocoder_uri_path() {
@@ -100,11 +134,27 @@ impl Regions {
                 let url = format!("{}/{geocoder_path}/{file}.bz2", self.data.geocoder_base);
                 let client = self.client.clone();
                 let tracker = tracker.clone();
-                downloads
-                    .spawn(async move { Self::download_bz2(client, tracker, &url, &path).await });
+                downloads.spawn(async move {
+                    Self::persist_bz2_download(client, tracker, &url, &path).await
+                });
             }
         }
 
+        // Download Valhalla files.
+        for package in &region.valhalla_packages {
+            let url = format!("{}/{package}.tar.bz2", self.data.valhalla_base);
+
+            let cache_dir = self.valhalla_cache_dir.clone();
+            let client = self.client.clone();
+            let tracker = tracker.clone();
+            let package = package.clone();
+            let db = self.db.clone();
+            downloads.spawn(async move {
+                Self::extract_valhalla_tiles(db, client, tracker, &url, &cache_dir, &package).await
+            });
+        }
+
+        // Download postal files.
         if let Some((postal_path, country_code)) = region.postal_uri_path() {
             // Download postal country files.
             for file in POSTAL_COUNTRY_FILES {
@@ -121,8 +171,9 @@ impl Regions {
                 );
                 let client = self.client.clone();
                 let tracker = tracker.clone();
-                downloads
-                    .spawn(async move { Self::download_bz2(client, tracker, &url, &path).await });
+                downloads.spawn(async move {
+                    Self::persist_bz2_download(client, tracker, &url, &path).await
+                });
             }
 
             // Download postal global files.
@@ -136,8 +187,9 @@ impl Regions {
                 let url = format!("{}/{file}.bz2", self.data.postal_global_base);
                 let client = self.client.clone();
                 let tracker = tracker.clone();
-                downloads
-                    .spawn(async move { Self::download_bz2(client, tracker, &url, &path).await });
+                downloads.spawn(async move {
+                    Self::persist_bz2_download(client, tracker, &url, &path).await
+                });
             }
         }
 
@@ -149,6 +201,9 @@ impl Regions {
             result??;
         }
 
+        // Load new Valhalla routing tiles.
+        self.router_reloader.ping();
+
         Ok(())
     }
 
@@ -156,8 +211,7 @@ impl Regions {
     ///
     /// This never removes the global postal data, since it's required to make
     /// search work with any region.
-    #[cfg_attr(feature = "profiling", profiling::function)]
-    pub fn delete(&self, region: &Region) {
+    pub async fn delete(&self, region: &Region) {
         // Delete geocoder data.
         if let Some((_, region_name)) = region.geocoder_uri_path() {
             let path = self.geocoder_cache_dir.join(region_name);
@@ -166,7 +220,36 @@ impl Regions {
             }
         }
 
-        // Delet postal country files, if they're not required by another region.
+        // Delete Valhalla packages, if they're not required by another region.
+        for package in &region.valhalla_packages {
+            if self.world().requires_valhalla_package(package, &region.name) {
+                continue;
+            }
+
+            let package_paths = match self.valhalla_package_paths(package).await {
+                Ok(package_paths) => package_paths,
+                Err(err) => {
+                    error!("Failed to load Valhalla package paths for {package:?}: {err}");
+                    continue;
+                },
+            };
+
+            // Delete individual files, keeping the directories.
+            for path in package_paths {
+                if let Err(err) = fs::remove_file(&path) {
+                    error!("Failed to delete {path:?}: {err}");
+                }
+            }
+
+            // Delete package paths from DB.
+            let _ = sqlx::query("DELETE FROM valhalla_packages WHERE package = $1")
+                .bind(package)
+                .execute(self.db.pool().await)
+                .await
+                .inspect_err(|err| error!("Failed to remove Valhalla package from DB: {err}"));
+        }
+
+        // Delete postal country files, if they're not required by another region.
         if let Some((postal_path, country_code)) = region.postal_uri_path()
             && !self.world().requires_postal_country(postal_path, &region.name)
         {
@@ -178,17 +261,19 @@ impl Regions {
     }
 
     /// Recursively update download status based on current filesystem state.
-    #[cfg_attr(feature = "profiling", profiling::function)]
-    pub fn refresh_download_state(&self) {
+    async fn refresh_download_state(&self) {
         // Check if global postal files are installed.
         let postal_global_installed =
             POSTAL_GLOBAL_FILES.iter().all(|file| self.postal_global_path().join(file).exists());
 
-        self.world().refresh_download_state(
-            &self.geocoder_cache_dir,
-            &self.postal_cache_dir,
-            postal_global_installed,
-        );
+        self.world()
+            .refresh_download_state(
+                &self.db,
+                &self.geocoder_cache_dir,
+                &self.postal_cache_dir,
+                postal_global_installed,
+            )
+            .await;
 
         // Ensure UI is updated on download state changes.
         self.ui_waker.ping();
@@ -211,21 +296,48 @@ impl Regions {
         Some(Region::geocoder_fs_path(&self.geocoder_cache_dir, region_name))
     }
 
-    /// Download a .bz2 file from `url` and write it uncompressed to `file`.
-    async fn download_bz2(
+    /// Get the valhalla tile storage root.
+    pub fn valhalla_tiles_path(&self) -> &PathBuf {
+        &self.valhalla_cache_dir
+    }
+
+    /// Unstall UI and mark the download view as dirty.
+    pub fn redraw_download_view(&self) {
+        self.ui_waker.ping();
+    }
+
+    /// Download a .bz2 file from `url` and decompress it to `path`.
+    async fn persist_bz2_download(
         client: Client,
         tracker: DownloadTracker,
         url: &str,
         path: &Path,
     ) -> Result<(), Error> {
-        // Send download request.
-        let mut response = client.get(url).send().await?.error_for_status()?;
-
-        // Create a streaming decoder into a tempfile.
+        // Create tempfile to write the data to.
         let parent = path.parent().ok_or(Error::UnexpectedRoot)?;
         tokio::fs::create_dir_all(&parent).await?;
         let mut file = NamedTempFile::new_in(parent)?;
-        let mut decoder = BzDecoder::new(&mut file);
+
+        Self::download_bz2(client, &tracker, url, file.as_file_mut()).await?;
+
+        // Atomically persist the tempfile to its target location.
+        file.persist(path)?;
+
+        Ok(())
+    }
+
+    /// Download a .bz2 file from `url` and decompress it into `file`.
+    async fn download_bz2(
+        client: Client,
+        tracker: &DownloadTracker,
+        url: &str,
+        file: &mut File,
+    ) -> Result<(), Error> {
+        // Create a streaming decoder into the file.
+        let mut decoder = BzDecoder::new(file);
+
+        // Send download request.
+        let mut response = client.get(url).send().await?.error_for_status()?;
 
         let content_length = response
             .headers()
@@ -242,10 +354,100 @@ impl Regions {
         decoder.finish()?;
         drop(decoder);
 
-        // Atomically place tempfile into target location.
-        file.persist(path)?;
+        Ok(())
+    }
+
+    /// Extract a valhalla tar archive.
+    async fn extract_valhalla_tiles(
+        db: Db,
+        client: Client,
+        tracker: DownloadTracker,
+        url: &str,
+        valhalla_cache_dir: &Path,
+        package: &str,
+    ) -> Result<(), Error> {
+        // Download and decompress the Valhalla archive.
+        let mut tempfile = NamedTempFile::new()?;
+        Self::download_bz2(client, &tracker, url, tempfile.as_file_mut()).await?;
+
+        // Use archive size to show unpacking progress.
+        let size = tempfile.as_file().metadata().map_or(0, |m| m.len());
+        let mut progress = 0;
+        tracker.add_download(size);
+
+        // Reopen tempfile to create archive reader from the start.
+        let mut archive_file = File::open(tempfile.path())?;
+        let mut archive = Archive::new(&mut archive_file);
+
+        let mut paths = Vec::new();
+        for entry in archive.entries_with_seek()? {
+            let entry = entry?;
+
+            // Add progress made since last entry.
+            let new_progress = entry.raw_file_position().saturating_sub(progress);
+            tracker.add_progress(new_progress);
+            progress = new_progress;
+
+            // Copy the file from the archive to its target location.
+            if let Some(path) = Self::extract_valhalla_tile(valhalla_cache_dir, entry)? {
+                let path_str = path.to_str().ok_or(Error::NonUtf8Path)?;
+                paths.push(path_str.to_string());
+            }
+        }
+
+        // Store package <-> path relationships in DB.
+        if !paths.is_empty() {
+            let mut builder = QueryBuilder::new("INSERT INTO valhalla_packages (package, path) ");
+            builder.push_values(paths, |mut builder, path| {
+                builder.push_bind(package);
+                builder.push_bind(path);
+            });
+            builder.push(" ON CONFLICT DO NOTHING");
+            builder.build().execute(db.pool().await).await?;
+        }
+
+        // Finish up progress to account for the last entry.
+        tracker.add_progress(size.saturating_sub(progress));
 
         Ok(())
+    }
+
+    /// Extract a single Valhalla tile from a tar archive.
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn extract_valhalla_tile<R: Read>(
+        valhalla_cache_dir: &Path,
+        mut entry: Entry<'_, R>,
+    ) -> Result<Option<PathBuf>, Error> {
+        // Ignore non-tile files.
+        if !entry.path_bytes().ends_with(b".gph.gz") {
+            return Ok(None);
+        }
+
+        // Get the target path for this tile.
+        let archive_path = entry.path()?;
+        let relative_path = archive_path
+            .strip_prefix("valhalla/tiles")
+            .map_err(|_| Error::ValhallaTilePrefixMissing)?;
+        let path = valhalla_cache_dir.join(relative_path);
+        let parent = path.parent().ok_or(Error::UnexpectedRoot)?;
+
+        // Write tile data to a temporary file.
+        fs::create_dir_all(parent)?;
+        let mut tempfile = NamedTempFile::new_in(parent)?;
+        io::copy(&mut entry, &mut tempfile)?;
+
+        // Atomically place tempfile into target location.
+        tempfile.persist(&path)?;
+
+        Ok(Some(path))
+    }
+
+    /// Get all storage paths for a Valhalla package.
+    async fn valhalla_package_paths(&self, package: &str) -> Result<Vec<String>, Error> {
+        Ok(sqlx::query_scalar("SELECT path FROM valhalla_packages WHERE package = $1")
+            .bind(package)
+            .fetch_all(self.db.pool().await)
+            .await?)
     }
 }
 
@@ -256,6 +458,7 @@ struct RegionData {
 
     postal_country_base: String,
     postal_global_base: String,
+    valhalla_base: String,
     geocoder_base: String,
 }
 
@@ -273,6 +476,7 @@ pub struct Region {
     // Complete size of this region and all of its children.
     pub storage_size: u64,
 
+    valhalla_packages: Vec<String>,
     geocoder_path: Option<String>,
     postal_path: Option<String>,
 
@@ -292,6 +496,12 @@ impl Region {
 
     /// Mark region as downloading.
     pub fn set_download_state(&self, download_state: DownloadState) {
+        // Ensure download tracker is reset when download is started.
+        if download_state == DownloadState::Downloading {
+            self.download_pending.store(0, Ordering::Relaxed);
+            self.download_done.store(0, Ordering::Relaxed);
+        }
+
         self.download_state.store(download_state as u8, Ordering::Relaxed);
     }
 
@@ -299,7 +509,7 @@ impl Region {
     pub fn download_progress(&self) -> f64 {
         let pending = self.download_pending.load(Ordering::Relaxed);
         let done = self.download_done.load(Ordering::Relaxed);
-        done as f64 / pending as f64
+        if pending == 0 { 0. } else { (done as f64 / pending as f64).min(1.) }
     }
 
     /// Get the current install size in bytes.
@@ -322,6 +532,12 @@ impl Region {
         size
     }
 
+    /// Check whether this region or any child has Valhalla tiles downloaded.
+    pub fn has_valhalla_tiles(&self) -> bool {
+        (!self.valhalla_packages.is_empty() && self.is_installed())
+            || self.regions.values().any(Region::has_valhalla_tiles)
+    }
+
     /// Execute a function for all child regions.
     #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn for_installed(&self, f: &mut impl FnMut(&Self)) {
@@ -335,24 +551,29 @@ impl Region {
     }
 
     /// Recursively update download status based on current filesystem state.
-    #[cfg_attr(feature = "profiling", profiling::function)]
-    fn refresh_download_state(
+    async fn refresh_download_state(
         &self,
+        db: &Db,
         geocoder_cache_dir: &Path,
         postal_cache_dir: &Path,
         postal_global_installed: bool,
     ) {
         // Update all subregions.
         for region in self.regions.values() {
-            region.refresh_download_state(
+            Box::pin(region.refresh_download_state(
+                db,
                 geocoder_cache_dir,
                 postal_cache_dir,
                 postal_global_installed,
-            );
+            ))
+            .await;
         }
 
         // Short-circuit if no data is available.
-        if self.geocoder_path.is_none() && self.postal_path.is_none() {
+        if self.geocoder_path.is_none()
+            && self.valhalla_packages.is_empty()
+            && self.postal_path.is_none()
+        {
             self.set_download_state(DownloadState::NoData);
             return;
         }
@@ -363,38 +584,62 @@ impl Region {
             return;
         }
 
-        // Assume all data has been downloaded.
-        let mut download_state = DownloadState::Downloaded;
-
         // Check if geocoder data needs to be downloaded.
         if let Some((_, region_name)) = self.geocoder_uri_path() {
             let geocoder_installed = GEOCODER_FILES
                 .iter()
                 .all(|file| geocoder_cache_dir.join(region_name).join(file).exists());
             if !geocoder_installed {
-                download_state = DownloadState::Available;
+                self.set_download_state(DownloadState::Available);
+                return;
             }
         }
 
         // Check if postal data needs to be downloaded,
         // unless geocoder is already missing.
-        if let Some((_, country_code)) =
-            self.postal_uri_path().filter(|_| download_state == DownloadState::Downloaded)
-        {
+        if let Some((_, country_code)) = self.postal_uri_path() {
             let postal_installed = POSTAL_COUNTRY_FILES.iter().all(|file| {
                 Self::postal_country_fs_path(postal_cache_dir, country_code).join(file).exists()
             });
             if !postal_installed {
-                download_state = DownloadState::Available;
+                self.set_download_state(DownloadState::Available);
+                return;
             }
         }
 
-        self.set_download_state(download_state);
+        // Check if there's at least one Valhalla tile per package.
+        for package in &self.valhalla_packages {
+            // Get filesystem paths for this package.
+            let paths: Result<Vec<String>, _> =
+                sqlx::query_scalar("SELECT path FROM valhalla_packages WHERE package = $1")
+                    .bind(package)
+                    .fetch_all(db.pool().await)
+                    .await;
+
+            match paths {
+                Ok(paths) => {
+                    if !paths.iter().all(|p| Path::new(p).exists()) {
+                        self.set_download_state(DownloadState::Available);
+                        return;
+                    }
+                },
+                Err(err) => {
+                    error!("Failed to read paths for Valhalla package {package}: {err}");
+
+                    self.set_download_state(DownloadState::Available);
+                    return;
+                },
+            }
+        }
+
+        // Mark as downloaded if no data is missing.
+        self.set_download_state(DownloadState::Downloaded);
     }
 
     /// Get region's download progress tracker.
-    fn download_tracker(&self) -> DownloadTracker {
+    fn download_tracker(&self, ui_waker: Ping) -> DownloadTracker {
         DownloadTracker {
+            ui_waker,
             download_pending: self.download_pending.clone(),
             download_done: self.download_done.clone(),
         }
@@ -450,6 +695,22 @@ impl Region {
         self.regions.values().any(|region| region.requires_postal_country(postal_path, filter))
     }
 
+    /// Check if a Valhalla package dataset is required by this region or its
+    /// children.
+    ///
+    /// The `filter` argument can be used to ignore a specific region, assuming
+    /// that it never requires the specified postal country dataset.
+    fn requires_valhalla_package(&self, package: &str, filter: &str) -> bool {
+        if self.name != filter
+            && self.valhalla_packages.iter().any(|p| p == package)
+            && self.download_state() == DownloadState::Downloaded
+        {
+            return true;
+        }
+
+        self.regions.values().any(|region| region.requires_valhalla_package(package, filter))
+    }
+
     /// Check whether this region's data is installed.
     ///
     /// This should be slightly faster than comparing `Self::download_state`
@@ -500,23 +761,20 @@ impl From<u8> for DownloadState {
 struct DownloadTracker {
     download_pending: Arc<AtomicU64>,
     download_done: Arc<AtomicU64>,
+    ui_waker: Ping,
 }
 
 impl DownloadTracker {
-    /// Clear all previously tracked progress.
-    fn reset(&self) {
-        self.download_pending.store(0, Ordering::Relaxed);
-        self.download_done.store(0, Ordering::Relaxed);
-    }
-
     /// Add a new download with no progress.
     fn add_download(&self, size: u64) {
         self.download_pending.fetch_add(size, Ordering::Relaxed);
+        self.ui_waker.ping();
     }
 
     /// Indicate a certain number of bytes have been downloaded.
     fn add_progress(&self, size: u64) {
         self.download_done.fetch_add(size, Ordering::Relaxed);
+        self.ui_waker.ping();
     }
 }
 
@@ -534,30 +792,30 @@ mod tests {
         let world = RegionData::new().unwrap().world_region;
         assert_eq!(world.name, "World");
         assert_eq!(world.geocoder_path, None);
-        assert_eq!(world.storage_size, 32457661728);
+        assert_eq!(world.storage_size, 111656154464);
 
         let europe = world.regions.get("europe").unwrap();
         assert_eq!(europe.name, "Europe");
         assert_eq!(europe.geocoder_path, None);
-        assert_eq!(europe.storage_size, 14428637247);
+        assert_eq!(europe.storage_size, 40147973727);
 
         let germany = europe.regions.get("germany").unwrap();
         assert_eq!(germany.name, "Germany");
         assert_eq!(germany.geocoder_path, None);
         assert_eq!(germany.postal_path, None);
-        assert_eq!(germany.storage_size, 2792185814);
+        assert_eq!(germany.storage_size, 8175312800);
 
         let baden = germany.regions.get("baden-wuerttemberg").unwrap();
         assert_eq!(baden.name, "Baden-Württemberg");
         assert_eq!(baden.geocoder_path, Some(GEOCEDER_BADEN.into()));
         assert_eq!(baden.postal_path, Some(POSTAL_DE.into()));
-        assert_eq!(baden.storage_size, 590606909);
+        assert_eq!(baden.storage_size, 1216916029);
 
         let karlsruhe = baden.regions.get("karlsruhe-regbez").unwrap();
         assert_eq!(karlsruhe.name, "Regierungsbezirk Karlsruhe");
         assert_eq!(karlsruhe.geocoder_path, Some(GEOCODER_KARLSRUHE.into()));
         assert_eq!(karlsruhe.postal_path, Some(POSTAL_DE.into()));
-        assert_eq!(karlsruhe.storage_size, 320152253);
+        assert_eq!(karlsruhe.storage_size, 569434813);
     }
 
     #[test]
@@ -566,11 +824,14 @@ mod tests {
             "https://data.modrana.org/osm_scout_server/postal-country-2";
         const POSTAL_GLOBAL_BASE: &str =
             "https://data.modrana.org/osm_scout_server/postal-global-2/postal/global-v1";
+        const VALHALLA_BASE: &str =
+            "https://data.modrana.org/osm_scout_server/valhalla-33/valhalla/packages";
         const GEOCODER_BASE: &str = "https://data.modrana.org/osm_scout_server/geocoder-nlp-39";
 
         let data = RegionData::new().unwrap();
         assert_eq!(data.postal_country_base, POSTAL_COUNTRY_BASE,);
         assert_eq!(data.postal_global_base, POSTAL_GLOBAL_BASE);
+        assert_eq!(data.valhalla_base, VALHALLA_BASE);
         assert_eq!(data.geocoder_base, GEOCODER_BASE);
     }
 }

@@ -28,6 +28,7 @@ use crate::ui::window::Window;
 use crate::wayland::{ProtocolStates, TextInput};
 
 mod config;
+mod db;
 mod dbus;
 mod entity_type;
 mod geocoder;
@@ -298,6 +299,8 @@ enum Error {
     #[error("{0}")]
     EventLoop(#[from] calloop::Error),
     #[error("{0}")]
+    Valhalla(#[from] valhalla::Error),
+    #[error("{0}")]
     Request(#[from] reqwest::Error),
     #[error("{0}")]
     Json(#[from] serde_json::Error),
@@ -312,10 +315,16 @@ enum Error {
     WaylandProtocol(&'static str, #[source] BindError),
     #[error("URL {0:?} is not a valid image")]
     InvalidImage(String),
+    #[error("Unexpected Valhalla response type")]
+    ValhallaInvalidResponseType,
+    #[error("Missing prefix in Valhalla tile archive")]
+    ValhallaTilePrefixMissing,
     #[error("Missing user cache directory")]
     MissingCacheDir,
     #[error("Unexpected root path")]
     UnexpectedRoot,
+    #[error("Unexpected non-utf8 codepoint in path")]
+    NonUtf8Path,
 }
 
 impl<T> From<calloop::InsertError<T>> for Error {

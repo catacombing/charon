@@ -3,13 +3,13 @@
 use std::any::Any;
 use std::ops::{Deref, DerefMut};
 use std::slice::IterMut;
-use std::sync::Arc;
 
 use calloop::LoopHandle;
 use reqwest::Client;
 use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers};
 
 use crate::config::Config;
+use crate::db::Db;
 use crate::geometry::{Point, Size};
 use crate::region::Regions;
 use crate::ui::skia::RenderState;
@@ -133,8 +133,10 @@ impl Views {
         );
         let client = Client::builder().user_agent(user_agent).build()?;
 
+        let db = Db::new()?;
+
         // Create geographic region manager.
-        let regions = Arc::new(Regions::new(event_loop.clone(), client.clone())?);
+        let regions = Regions::new(event_loop.clone(), client.clone(), db.clone())?;
 
         let download_view =
             Box::new(DownloadView::new(event_loop.clone(), config, regions.clone(), size)?);
@@ -145,7 +147,7 @@ impl Views {
             regions.clone(),
             size,
         )?);
-        let map_view = Box::new(MapView::new(event_loop.clone(), client, config, size)?);
+        let map_view = Box::new(MapView::new(event_loop.clone(), client, db, config, size)?);
 
         Ok(Self { views: [map_view, search_view, download_view], active_view: Default::default() })
     }

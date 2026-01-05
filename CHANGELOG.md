@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - GPS locking on GPS button triple-click in maps view
+- Offline routing
 
 ## 1.0.0
 

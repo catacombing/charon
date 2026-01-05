@@ -98,8 +98,8 @@ impl SearchView {
         regions: Arc<Regions>,
         size: Size,
     ) -> Result<Self, Error> {
-        let geocoder = Geocoder::new(event_loop.clone(), config, client.clone(), regions)?;
-        let router = Router::new(event_loop.clone(), config, client)?;
+        let geocoder = Geocoder::new(event_loop.clone(), config, client.clone(), regions.clone())?;
+        let router = Router::new(event_loop.clone(), config, client, regions)?;
 
         // Initialize UI elements.
 

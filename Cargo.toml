@@ -50,11 +50,13 @@ serde = { version = "1.0.228", features = ["derive", "rc"] }
 skia-safe = { version = "0.91.0", features = ["all-linux", "textlayout"] }
 smithay-client-toolkit = { version = "0.20.0", default-features = false, features = ["xkbcommon"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "macros", "migrate", "sqlite"] }
+tar = { version = "0.4.44", default-features = false }
 tempfile = "3.23.0"
 thiserror.workspace = true
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "fs"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+valhalla = "0.6.25"
 wayland-backend = { version = "0.3.11", features = ["client_system"] }
 zbus = { version = "5.12.0", default-features = false, features =  ["tokio"] }
 

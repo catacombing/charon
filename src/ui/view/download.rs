@@ -11,9 +11,9 @@ use skia_safe::{Color4f, Paint, Rect};
 use tracing::error;
 
 use crate::config::{Config, Input};
+use crate::db::Db;
 use crate::geometry::{Point, Size, rect_contains};
 use crate::region::{DownloadState, Region, Regions};
-use crate::tiles::Tiles;
 use crate::ui::skia::RenderState;
 use crate::ui::view::{UiView, View};
 use crate::ui::{Button, Svg, Velocity};
@@ -407,7 +407,6 @@ impl UiView for DownloadView {
         render_state.clip_rect(clip_rect, None, Some(false));
 
         // Render region entries.
-        let mut downloading = false;
         let region = self.region();
         for (_, region) in region.regions.iter().rev() {
             if region_point.y > region_start.y + (region_size.height as i32) {
@@ -419,8 +418,6 @@ impl UiView for DownloadView {
 
             self.draw_region(config, &mut render_state, region_point, region_size, region);
             region_point.y -= region_size.height as i32 + padding;
-
-            downloading |= region.download_state() == DownloadState::Downloading;
         }
 
         // Reset region clipping mask.
@@ -470,9 +467,6 @@ impl UiView for DownloadView {
 
         // Render navigation button.
         self.back_button.draw(&mut render_state, config.colors.alt_background);
-
-        // Continuously redraw while downloads are in progress.
-        self.dirty |= downloading;
     }
 
     fn dirty(&self) -> bool {
@@ -583,7 +577,6 @@ impl UiView for DownloadView {
 
                         let current_region = self.current_region;
                         let regions = self.regions.clone();
-
                         tokio::spawn(async move {
                             // Re-index the region, since we can't move the reference.
                             let mut region = Self::index_region(regions.world(), &current_region);
@@ -595,18 +588,32 @@ impl UiView for DownloadView {
                                     error!("Region data download failed: {err}");
 
                                     // Delete all data to avoid tempfiles stealing storage space.
-                                    regions.delete(region);
+                                    regions.delete(region).await;
 
                                     region.set_download_state(DownloadState::Available);
                                 },
                             }
+
+                            // Wake UI to display the download state update.
+                            regions.redraw_download_view();
                         });
                     },
                     // Delete region's local data.
                     (_, region, DownloadState::Downloaded) => {
+                        // Immediately mark region as available for download.
                         region.set_download_state(DownloadState::Available);
-                        self.regions.delete(region);
                         self.dirty = true;
+
+                        // Delete region data in the background.
+                        let current_region = self.current_region;
+                        let regions = self.regions.clone();
+                        tokio::spawn(async move {
+                            // Re-index the region, since we can't move the reference.
+                            let mut region = Self::index_region(regions.world(), &current_region);
+                            region = &region.regions[index];
+
+                            regions.delete(region).await
+                        });
                     },
                     // Ignore touch on region when region doesn't have child regions.
                     (_, region, _) if region.regions.is_empty() => (),
@@ -649,7 +656,10 @@ impl UiView for DownloadView {
 
     fn enter(&mut self) {
         // Update current tiles storage size.
-        self.tiles_size = Tiles::tiles_path()
+        //
+        // While the database includes data beyond just the tile storage itself, that
+        // should be negligible in comparison to the size used for the tiles.
+        self.tiles_size = Db::path()
             .ok()
             .and_then(|path| fs::metadata(path).ok())
             .map_or(0, |metadata| metadata.len());

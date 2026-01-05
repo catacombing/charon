@@ -24,7 +24,7 @@ The following noteworthy features are currently supported:
  - Raster tile maps (partially offline, tiles need to be manually loaded once)
  - POI / Address search (fully offline)
  - List POIs/Addresses at location (fully offline)
- - Routing (online only)
+ - Routing (fully offline)
  - ModemManager GPS integration
 
 The following features are **not** supported yet, but are on the roadmap:
@@ -44,6 +44,7 @@ cargo build --release
 To compile Charon, the following dependencies are required:
  - boost (compile time)
  - kyotocabinet (runtime)
+ - protobuf (runtime)
  - sqlite3 (runtime)
  - marisa (runtime)
 

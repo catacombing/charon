@@ -5,26 +5,32 @@ use std::sync::{Arc, mpsc};
 use calloop::channel::Event;
 use calloop::{LoopHandle, channel};
 use reqwest::Client;
+use tracing::error;
 
 use crate::config::Config;
 use crate::geometry::GeoPoint;
+use crate::region::Regions;
+use crate::router::valhalla::offline::Router as OfflineRouter;
+use crate::router::valhalla::online::Router as OnlineRouter;
 use crate::ui::view::View;
 use crate::ui::view::search::QueryId;
 use crate::{Error, State};
 
-mod valhalla_api;
+mod valhalla;
 
 /// Multi-provider router
 pub struct Router {
-    valhalla_api_query_tx: Option<mpsc::Sender<RoutingQuery>>,
+    valhalla_online_query_tx: Option<mpsc::Sender<RoutingQuery>>,
+    valhalla_offline_query_tx: Option<mpsc::Sender<RoutingQuery>>,
 
     result_tx: channel::Sender<(QueryId, RoutingUpdate)>,
     valhalla_url: Arc<String>,
+    regions: Arc<Regions>,
     client: Client,
 
-    results: Vec<Route>,
     last_query: QueryId,
-    valhalla_api_routing: bool,
+    valhalla_offline_routing: bool,
+    valhalla_online_routing: bool,
 }
 
 impl Router {
@@ -32,6 +38,7 @@ impl Router {
         event_loop: LoopHandle<'static, State>,
         config: &Config,
         client: Client,
+        regions: Arc<Regions>,
     ) -> Result<Self, Error> {
         let (result_tx, result_rx) = channel::channel();
 
@@ -47,79 +54,89 @@ impl Router {
             };
 
             match query_event {
-                // Update routing results.
-                RoutingUpdate::Results(route) => router.results.push(route),
-                // Mark current Valhalla API routing as done.
-                RoutingUpdate::ValhallaApiDone => router.valhalla_api_routing = false,
+                // Finish routing when any result is found, since only one result is returned.
+                RoutingUpdate::Route(route) => {
+                    state.window.views.map().set_route(route);
+                    state.window.set_view(View::Map);
+                    return;
+                },
+                // Mark current Valhalla online routing as done.
+                RoutingUpdate::ValhallaApiDone => router.valhalla_online_routing = false,
+                // Mark current Valhalla offline routing as done.
+                RoutingUpdate::ValhallaOfflineDone => router.valhalla_offline_routing = false,
             }
 
-            // Once all routers are done, close the search to show the route.
+            // Show error if no route was found.
             if !router.routing() {
-                if router.results.is_empty() {
-                    state.window.views.search().set_error("No Route Found");
-                    state.window.unstall();
-                } else {
-                    // Extract shortest route from all results.
-                    router.results.sort_unstable_by(|a, b| a.time.cmp(&b.time));
-                    let shortest_route = router.results.swap_remove(0);
-                    router.results.clear();
-
-                    state.window.views.map().set_route(shortest_route);
-
-                    state.window.set_view(View::Map);
-                }
+                state.window.views.search().set_error("No Route Found");
+                state.window.unstall();
             }
         })?;
 
         // Spawn Valhalla API routing engine.
-        let valhalla_api_query_tx = (!config.search.valhalla_url.is_empty()).then(|| {
+        let valhalla_online_query_tx = (!config.search.valhalla_url.is_empty()).then(|| {
             let (query_tx, query_rx) = mpsc::channel::<RoutingQuery>();
-            valhalla_api::Router::spawn(client.clone(), config, query_rx, result_tx.clone());
+            OnlineRouter::spawn(client.clone(), config, query_rx, result_tx.clone());
             query_tx
         });
 
         Ok(Self {
-            valhalla_api_query_tx,
+            valhalla_online_query_tx,
             result_tx,
+            regions,
             client,
             valhalla_url: config.search.valhalla_url.clone(),
             last_query: QueryId::new(),
-            valhalla_api_routing: Default::default(),
-            results: Default::default(),
+            valhalla_offline_query_tx: Default::default(),
+            valhalla_offline_routing: Default::default(),
+            valhalla_online_routing: Default::default(),
         })
     }
 
     /// Submit a routing query to all engines.
     pub fn route(&mut self, query: RoutingQuery) {
         self.last_query = query.id;
-        self.valhalla_api_routing = true;
-        self.results.clear();
 
-        if let Some(query_tx) = &self.valhalla_api_query_tx {
+        if let Some(query_tx) = &self.valhalla_online_query_tx {
+            self.valhalla_online_routing = true;
+            let _ = query_tx.send(query);
+        }
+        if let Some(query_tx) = &self.valhalla_offline_query_tx {
+            self.valhalla_offline_routing = true;
             let _ = query_tx.send(query);
         }
     }
 
     /// Check if routing is finished.
     pub fn routing(&self) -> bool {
-        self.valhalla_api_routing
+        self.valhalla_online_routing || self.valhalla_offline_routing
     }
 
     /// Handle config updates.
     pub fn update_config(&mut self, config: &Config) {
         // Restart Valhalla API routing engine on URL change.
         if config.search.valhalla_url != self.valhalla_url {
+            // Drop old router first, to improve log order.
+            self.valhalla_online_query_tx = None;
+
             self.valhalla_url = config.search.valhalla_url.clone();
-            self.valhalla_api_query_tx = (!config.search.valhalla_url.is_empty()).then(|| {
+            self.valhalla_online_query_tx = (!config.search.valhalla_url.is_empty()).then(|| {
                 let (query_tx, query_rx) = mpsc::channel::<RoutingQuery>();
-                valhalla_api::Router::spawn(
-                    self.client.clone(),
-                    config,
-                    query_rx,
-                    self.result_tx.clone(),
-                );
+                OnlineRouter::spawn(self.client.clone(), config, query_rx, self.result_tx.clone());
                 query_tx
             });
+        }
+    }
+
+    /// Reload offline router, to refresh the Valhalla tiles.
+    pub fn reload_offline_router(&mut self) {
+        // Drop old router first, to improve log order.
+        self.valhalla_offline_query_tx = None;
+
+        let (valhalla_offline_query_tx, query_rx) = mpsc::channel::<RoutingQuery>();
+        match OfflineRouter::spawn(self.regions.clone(), query_rx, self.result_tx.clone()) {
+            Ok(_) => self.valhalla_offline_query_tx = Some(valhalla_offline_query_tx),
+            Err(err) => error!("Failed to create Valhalla offline router: {err}"),
         }
     }
 }
@@ -141,9 +158,11 @@ impl RoutingQuery {
 /// Routing query update event.
 pub enum RoutingUpdate {
     /// New query results available.
-    Results(Route),
-    /// Valhalla online wrouting is done, no more results will be delivered.
+    Route(Route),
+    /// Valhalla online routing is done, no more results will be delivered.
     ValhallaApiDone,
+    /// Valhalla offline routing is done, no more results will be delivered.
+    ValhallaOfflineDone,
 }
 
 /// Routing result.
@@ -152,7 +171,7 @@ pub struct Route {
     /// Trip segments.
     pub segments: Vec<Segment>,
     /// Complete trip time in seconds.
-    pub time: u64,
+    pub _time: u64,
     /// Complete trip length in kilometers.
     pub _length: f64,
 }

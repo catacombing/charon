@@ -31,6 +31,7 @@ struct Regions {
 
     postal_country_base: String,
     postal_global_base: String,
+    valhalla_base: String,
     geocoder_base: String,
 }
 
@@ -45,8 +46,10 @@ impl Regions {
             "{}/{}/{}",
             modrana.url.base, modrana.url.postal_global, modrana.postal_global.postal_global.path
         );
+        let valhalla_base =
+            format!("{}/{}/valhalla/packages", modrana.url.base, modrana.url.valhalla);
         let geocoder_base = format!("{}/{}", modrana.url.base, modrana.url.geocoder_nlp);
 
-        Self { postal_country_base, postal_global_base, geocoder_base, world_region }
+        Self { postal_country_base, postal_global_base, valhalla_base, geocoder_base, world_region }
     }
 }

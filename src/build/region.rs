@@ -14,6 +14,7 @@ pub struct Region {
     name: String,
     regions: IndexMap<String, Region>,
 
+    valhalla_packages: Vec<String>,
     geocoder_path: Option<String>,
     postal_path: Option<String>,
 
@@ -21,6 +22,8 @@ pub struct Region {
     storage_size: u64,
     #[serde(skip)]
     geocoder_size: u64,
+    #[serde(skip)]
+    valhalla_size: u64,
     #[serde(skip)]
     postal_size: u64,
 }
@@ -33,8 +36,10 @@ impl Region {
 
         let mut region = Region {
             name: "World".into(),
+            valhalla_packages: Default::default(),
             geocoder_path: Default::default(),
             geocoder_size: Default::default(),
+            valhalla_size: Default::default(),
             storage_size: Default::default(),
             postal_path: Default::default(),
             postal_size: Default::default(),
@@ -60,8 +65,10 @@ impl Region {
                 geocoder_region =
                     geocoder_region.regions.entry(id.into()).or_insert_with(|| Region {
                         name: name.into(),
+                        valhalla_packages: Default::default(),
                         geocoder_path: Default::default(),
                         geocoder_size: Default::default(),
+                        valhalla_size: Default::default(),
                         storage_size: Default::default(),
                         postal_path: Default::default(),
                         postal_size: Default::default(),
@@ -73,6 +80,11 @@ impl Region {
             let geocoder_size = str::parse(&modrana_region.geocoder_nlp.size).unwrap();
             geocoder_region.geocoder_path = Some(modrana_region.geocoder_nlp.path);
             geocoder_region.geocoder_size = geocoder_size;
+
+            // Set valhalla packages for this region.
+            let valhalla_size = str::parse(&modrana_region.valhalla.size).unwrap();
+            geocoder_region.valhalla_packages = modrana_region.valhalla.packages;
+            geocoder_region.valhalla_size = valhalla_size;
 
             // Set libpostal URL for this region's language.
             let postal_size = str::parse(&modrana_region.postal_country.size).unwrap();
@@ -87,9 +99,13 @@ impl Region {
     }
 
     /// Process region list into more optimal storage format.
-    fn postprocess(&mut self, postal_global_size: u64) -> (HashSet<(String, u64)>, u64) {
-        // Handle regions with postal/geocoder data available.
-        if self.postal_size != 0 && self.geocoder_size != 0 {
+    #[allow(clippy::type_complexity)]
+    fn postprocess(
+        &mut self,
+        postal_global_size: u64,
+    ) -> (HashSet<(String, u64)>, HashSet<(String, u64)>, u64) {
+        // Handle regions with postal/geocoder/valhalla data available.
+        if self.postal_size != 0 && self.geocoder_size != 0 && self.valhalla_size != 0 {
             // Ensure regions are stored in reverse alphabetical order.
             self.regions.sort_unstable_by(|k1, _, k2, _| k2.cmp(k1));
 
@@ -99,22 +115,31 @@ impl Region {
             }
 
             // Update this region's storage size.
-            self.storage_size = self.geocoder_size + self.postal_size + postal_global_size;
+            self.storage_size =
+                self.geocoder_size + self.valhalla_size + self.postal_size + postal_global_size;
 
-            // Return size of this region's postal and geocoder data.
+            // Get valhalla package sizes.
+            // Since we only get the combined size, we approximate things by dividing it
+            // evenly.
+            let avg_size = self.valhalla_size / self.valhalla_packages.len() as u64;
+            let valhalla_packages =
+                self.valhalla_packages.clone().into_iter().map(|p| (p, avg_size)).collect();
+
+            // Return size of this region's postal, valhalla, and geocoder data.
             let mut postal_countries = HashSet::new();
             postal_countries.insert((self.postal_path.clone().unwrap(), self.postal_size));
-            return (postal_countries, self.geocoder_size);
+            return (postal_countries, valhalla_packages, self.geocoder_size);
         }
 
         // Ensure regions are stored in reverse alphabetical order.
         self.regions.sort_unstable_by(|k1, _, k2, _| k2.cmp(k1));
 
         // Calculate geocoder and postal size from children.
+        let mut valhalla_packages = HashSet::new();
         let mut postal_countries = HashSet::new();
         for region in self.regions.values_mut() {
             // Add geocoder size.
-            let (countries, geocoder_size) = region.postprocess(postal_global_size);
+            let (countries, packages, geocoder_size) = region.postprocess(postal_global_size);
             self.geocoder_size += geocoder_size;
 
             // Add postal size for each new postal country.
@@ -123,11 +148,19 @@ impl Region {
                     self.postal_size += country_size;
                 }
             }
+
+            // Add valhalla size for each new package.
+            for (package, package_size) in packages {
+                if valhalla_packages.insert((package, package_size)) {
+                    self.valhalla_size += package_size;
+                }
+            }
         }
 
         // Update this node's combined storage size.
-        self.storage_size = self.geocoder_size + self.postal_size + postal_global_size;
+        self.storage_size =
+            self.geocoder_size + self.valhalla_size + self.postal_size + postal_global_size;
 
-        (postal_countries, self.geocoder_size)
+        (postal_countries, valhalla_packages, self.geocoder_size)
     }
 }

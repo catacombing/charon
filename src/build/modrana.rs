@@ -50,6 +50,7 @@ pub struct Urls {
     pub postal_country: String,
     pub postal_global: String,
     pub geocoder_nlp: String,
+    pub valhalla: String,
     pub base: String,
 }
 
@@ -61,7 +62,6 @@ pub struct PostalGlobal {
 
 /// Global postal data path and stats.
 #[derive(Deserialize, Debug)]
-#[serde(rename_all = "kebab-case")]
 pub struct PostalGlobalData {
     pub path: String,
     pub size: String,
@@ -71,21 +71,27 @@ pub struct PostalGlobalData {
 #[derive(Deserialize, Debug)]
 pub struct Region {
     pub geocoder_nlp: GeocoderRegion,
+    pub valhalla: ValhallaRegion,
     pub postal_country: PostalRegion,
     pub name: String,
 }
 
 /// Geocoder path and stats for a region.
 #[derive(Deserialize, Debug)]
-#[serde(rename_all = "kebab-case")]
 pub struct GeocoderRegion {
     pub path: String,
     pub size: String,
 }
 
+/// Valhalla packages and stats for a region.
+#[derive(Deserialize, Debug)]
+pub struct ValhallaRegion {
+    pub packages: Vec<String>,
+    pub size: String,
+}
+
 /// Postal path and stats for a region.
 #[derive(Deserialize, Debug)]
-#[serde(rename_all = "kebab-case")]
 pub struct PostalRegion {
     pub path: String,
     pub size: String,

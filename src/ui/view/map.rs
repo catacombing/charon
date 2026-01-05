@@ -15,6 +15,7 @@ use skia_safe::{
 use tracing::error;
 
 use crate::config::{Config, Input};
+use crate::db::Db;
 use crate::dbus::modem_manager;
 use crate::geometry::{self, GeoPoint, Point, Size, rect_intersects_line};
 use crate::router::Route;
@@ -93,6 +94,7 @@ impl MapView {
     pub fn new(
         event_loop: LoopHandle<'static, State>,
         client: Client,
+        db: Db,
         config: &Config,
         size: Size,
     ) -> Result<Self, Error> {
@@ -107,7 +109,7 @@ impl MapView {
                 state.window.unstall();
             }
         })?;
-        let tiles = Tiles::new(client, tile_tx, config)?;
+        let tiles = Tiles::new(client, db, tile_tx, config)?;
 
         // Listen for new GPS location updates.
         Self::spawn_gps(&event_loop)?;

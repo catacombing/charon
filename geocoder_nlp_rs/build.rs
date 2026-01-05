@@ -5,18 +5,6 @@ use cc::Build;
 use pkg_config::Config as PkgConfig;
 
 fn main() {
-    // Find and link dynamically against common geocoder-nlp dependencies.
-    let kyotocabinet = PkgConfig::new().atleast_version("1.0.0").probe("kyotocabinet").unwrap();
-    let sqlite3 = PkgConfig::new().atleast_version("3.0.0").probe("sqlite3").unwrap();
-    let marisa = PkgConfig::new().atleast_version("0.2.0").probe("marisa").unwrap();
-
-    // Collect include paths, so cxx_build can find them when cross-compiling.
-    let mut include_paths = kyotocabinet.include_paths;
-    include_paths.extend(sqlite3.include_paths);
-    include_paths.extend(marisa.include_paths);
-    include_paths.sort_unstable();
-    include_paths.dedup();
-
     // Compile libpostal for static linking, since it's usually not packaged.
 
     let mut build = Build::new();
@@ -107,6 +95,18 @@ fn main() {
     let dir = Path::new(&out_dir).join("libpostal");
     fs::create_dir_all(&dir).unwrap();
     fs::copy("libpostal/src/libpostal.h", dir.join("libpostal.h")).unwrap();
+
+    // Find and link dynamically against common geocoder-nlp dependencies.
+    let kyotocabinet = PkgConfig::new().atleast_version("1.0.0").probe("kyotocabinet").unwrap();
+    let sqlite3 = PkgConfig::new().atleast_version("3.0.0").probe("sqlite3").unwrap();
+    let marisa = PkgConfig::new().atleast_version("0.2.0").probe("marisa").unwrap();
+
+    // Collect include paths, so cxx_build can find them when cross-compiling.
+    let mut include_paths = kyotocabinet.include_paths;
+    include_paths.extend(sqlite3.include_paths);
+    include_paths.extend(marisa.include_paths);
+    include_paths.sort_unstable();
+    include_paths.dedup();
 
     // Compile geocoder-nlp and its Rust bindings.
     cxx_build::bridge("src/ffi.rs")

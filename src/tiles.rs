@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, LinkedList};
 use std::iter;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -10,16 +9,16 @@ use std::time::Duration;
 use calloop::channel::Sender;
 use reqwest::Client;
 use skia_safe::{Data, Image};
-use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqliteJournalMode, SqliteRow, SqliteSynchronous};
-use sqlx::{FromRow, Pool, Row};
+use sqlx::sqlite::SqliteRow;
+use sqlx::{FromRow, Row};
 use tokio::runtime::Handle as RuntimeHandle;
-use tokio::sync::SetOnce;
 use tokio::task::{self, JoinHandle};
 use tokio::time;
 use tracing::error;
 
 use crate::Error;
 use crate::config::Config;
+use crate::db::Db;
 use crate::geometry::{Point, Size};
 
 /// Width and height of a single tile.
@@ -54,10 +53,14 @@ pub struct Tiles {
 }
 
 impl Tiles {
-    pub fn new(client: Client, tile_tx: Sender<TileIndex>, config: &Config) -> Result<Self, Error> {
+    pub fn new(
+        client: Client,
+        db: Db,
+        tile_tx: Sender<TileIndex>,
+        config: &Config,
+    ) -> Result<Self, Error> {
         // Initialize filesystem cache and remove outdated maps.
-        let tiles_path = Self::tiles_path()?;
-        let fs_cache = FsCache::new(config, tiles_path);
+        let fs_cache = FsCache::new(config, db);
         let cleanup_cache = fs_cache.clone();
         tokio::spawn(async move { cleanup_cache.clean_cache().await });
 
@@ -113,11 +116,6 @@ impl Tiles {
     /// Access the underlying SQLite tiles DB.
     pub fn fs_cache(&self) -> &FsCache {
         &self.download_state.fs_cache
-    }
-
-    /// Get the storage path for the tiles sqlite DB.
-    pub fn tiles_path() -> Result<PathBuf, Error> {
-        Ok(dirs::cache_dir().ok_or(Error::MissingCacheDir)?.join("charon/tiles.sqlite"))
     }
 }
 
@@ -457,7 +455,7 @@ impl LruCache {
 
 /// A filesystem cach for tiles.
 pub struct FsCache {
-    pool: Arc<SetOnce<Pool<Sqlite>>>,
+    db: Db,
     last_cleanup: Arc<AtomicU16>,
     tileserver: Arc<String>,
     capacity: u32,
@@ -465,24 +463,9 @@ pub struct FsCache {
 
 impl FsCache {
     #[cfg_attr(feature = "profiling", profiling::function)]
-    fn new(config: &Config, path: impl AsRef<Path>) -> Self {
-        let options = SqliteConnectOptions::new()
-            .filename(path)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
-            .create_if_missing(true);
-
-        // Initialize DB connection in the background.
-        let pool = Arc::new(SetOnce::new());
-        let future_pool = pool.clone();
-        tokio::spawn(async move {
-            if let Err(err) = Self::init_pool(options, future_pool).await {
-                error!("Failed to initialize filesystem cache: {err}");
-            }
-        });
-
+    fn new(config: &Config, db: Db) -> Self {
         Self {
-            pool,
+            db,
             last_cleanup: Arc::new(AtomicU16::new(0)),
             tileserver: config.tiles.server.clone(),
             capacity: config.tiles.max_fs_tiles,
@@ -491,7 +474,7 @@ impl FsCache {
 
     /// Close the SQLite database connection.
     pub async fn close(&self) {
-        let pool = self.pool.wait().await;
+        let pool = self.db.pool().await;
 
         // Defragment and truncate database file.
         //
@@ -509,7 +492,7 @@ impl FsCache {
         #[rustfmt::skip]
         sqlx::query(
             "INSERT INTO tile (tileserver, x, y, z, data) \
-                VALUES (?, ?, ?, ?, ?) \
+                VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT DO UPDATE \
                 SET data = excluded.data, ctime = unixepoch(), atime = unixepoch()",
         )
@@ -518,7 +501,7 @@ impl FsCache {
         .bind(index.y)
         .bind(index.z)
         .bind(data)
-        .execute(self.pool.wait().await)
+        .execute(self.db.pool().await)
         .await?;
 
         // Cleanup cache every `FS_CACHE_CLEANUP_INTERVAL` inserts.
@@ -539,44 +522,29 @@ impl FsCache {
         #[rustfmt::skip]
         let data = sqlx::query_as(
             "UPDATE tile SET atime = unixepoch() \
-                WHERE tileserver = ? AND x = ? AND y = ? and z = ? \
+                WHERE tileserver = $1 AND x = $2 AND y = $3 and z = $4 \
              RETURNING unixepoch() - ctime as age_secs, data",
         )
         .bind(&*self.tileserver)
         .bind(index.x)
         .bind(index.y)
         .bind(index.z)
-        .fetch_optional(self.pool.wait().await)
+        .fetch_optional(self.db.pool().await)
         .await?;
         Ok(data)
     }
 
     /// Perform filesystem cache cleanup.
     async fn clean_cache(&self) -> Result<(), Error> {
-        let pool = self.pool.wait().await;
+        let pool = self.db.pool().await;
 
         // Delete least recently used tiles beyond the tile capacity.
         sqlx::query(
-            "DELETE FROM tile WHERE id NOT IN (SELECT id FROM tile ORDER BY atime DESC LIMIT ?)",
+            "DELETE FROM tile WHERE id NOT IN (SELECT id FROM tile ORDER BY atime DESC LIMIT $1)",
         )
         .bind(self.capacity)
         .execute(pool)
         .await?;
-
-        Ok(())
-    }
-
-    /// Asynchronously initialize the database pool.
-    async fn init_pool(
-        options: SqliteConnectOptions,
-        setter: Arc<SetOnce<Pool<Sqlite>>>,
-    ) -> Result<(), Error> {
-        let pool = Pool::connect_with(options).await?;
-
-        // Run database migrations.
-        sqlx::migrate!("./migrations").run(&pool).await?;
-
-        let _ = setter.set(pool);
 
         Ok(())
     }
@@ -595,7 +563,7 @@ impl Clone for FsCache {
             last_cleanup: Arc::new(AtomicU16::new(last_cleanup)),
             tileserver: self.tileserver.clone(),
             capacity: self.capacity,
-            pool: self.pool.clone(),
+            db: self.db.clone(),
         }
     }
 }
