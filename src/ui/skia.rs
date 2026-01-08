@@ -399,12 +399,14 @@ pub struct GlConfig {
 #[derive(Hash, PartialEq, Eq, Copy, Clone, Debug)]
 pub enum Svg {
     CancelRoute,
+    Pedestrian,
     ArrowLeft,
     Download,
     Config,
     Search,
     Route,
     Bin,
+    Car,
     Gps,
 }
 
@@ -413,12 +415,14 @@ impl Svg {
     const fn content(&self) -> &'static [u8] {
         match self {
             Self::CancelRoute => include_bytes!("../../svgs/cancel_route.svg"),
+            Self::Pedestrian => include_bytes!("../../svgs/pedestrian.svg"),
             Self::ArrowLeft => include_bytes!("../../svgs/arrow_left.svg"),
             Self::Download => include_bytes!("../../svgs/download.svg"),
             Self::Config => include_bytes!("../../svgs/config.svg"),
             Self::Search => include_bytes!("../../svgs/search.svg"),
             Self::Route => include_bytes!("../../svgs/route.svg"),
             Self::Bin => include_bytes!("../../svgs/bin.svg"),
+            Self::Car => include_bytes!("../../svgs/car.svg"),
             Self::Gps => include_bytes!("../../svgs/gps.svg"),
         }
     }

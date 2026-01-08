@@ -125,6 +125,11 @@ impl Button {
         self.size = size;
     }
 
+    /// Change the button's SVG.
+    pub fn set_svg(&mut self, svg: Svg) {
+        self.svg = svg;
+    }
+
     /// Check if a point lies within this button.
     pub fn contains(&self, point: Point<f64>) -> bool {
         let point = Point::new(point.x.round() as i32, point.y.round() as i32);

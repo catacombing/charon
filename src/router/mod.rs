@@ -5,6 +5,7 @@ use std::sync::{Arc, mpsc};
 use calloop::channel::Event;
 use calloop::{LoopHandle, channel};
 use reqwest::Client;
+use serde::Serialize;
 use tracing::error;
 
 use crate::config::Config;
@@ -12,6 +13,7 @@ use crate::geometry::GeoPoint;
 use crate::region::Regions;
 use crate::router::valhalla::offline::Router as OfflineRouter;
 use crate::router::valhalla::online::Router as OnlineRouter;
+use crate::ui::skia::Svg;
 use crate::ui::view::View;
 use crate::ui::view::search::QueryId;
 use crate::{Error, State};
@@ -144,14 +146,35 @@ impl Router {
 /// Routing query.
 #[derive(Copy, Clone)]
 pub struct RoutingQuery {
-    id: QueryId,
-    origin: GeoPoint,
-    target: GeoPoint,
+    pub id: QueryId,
+    pub origin: GeoPoint,
+    pub target: GeoPoint,
+    pub mode: Mode,
 }
 
 impl RoutingQuery {
-    pub fn new(origin: GeoPoint, target: GeoPoint) -> Self {
-        Self { origin, target, id: QueryId::new() }
+    pub fn new(origin: GeoPoint, target: GeoPoint, mode: Mode) -> Self {
+        Self { mode, origin, target, id: QueryId::new() }
+    }
+}
+
+/// Routing travel modes.
+#[derive(Serialize, Default, Copy, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    // XXX: Integer values must match [`valhalla::proto::costing::Type`].
+    Pedestrian = 5,
+    #[default]
+    Auto = 10,
+}
+
+impl Mode {
+    /// Get corresponding SVG icon for this route.
+    pub fn svg(&self) -> Svg {
+        match self {
+            Self::Pedestrian => Svg::Pedestrian,
+            Self::Auto => Svg::Car,
+        }
     }
 }
 

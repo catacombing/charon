@@ -5,7 +5,6 @@ use std::sync::{Arc, mpsc};
 use calloop::channel;
 use tracing::{error, info};
 use valhalla::proto::Options;
-use valhalla::proto::costing::Type as CostingType;
 use valhalla::{Actor, Config, Response};
 
 use crate::Error;
@@ -67,7 +66,7 @@ impl Router {
     /// Process a routing query.
     async fn route(&mut self, query: RoutingQuery) -> Result<(), Error> {
         let request = Options {
-            costing_type: CostingType::Auto as i32,
+            costing_type: query.mode as i32,
             locations: vec![query.origin.into(), query.target.into()],
             ..Default::default()
         };

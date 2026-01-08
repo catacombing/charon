@@ -18,7 +18,7 @@ use crate::config::{Config, Input};
 use crate::geocoder::{Geocoder, QueryResult, ReverseQuery, SearchQuery};
 use crate::geometry::{GeoPoint, Point, Size};
 use crate::region::Regions;
-use crate::router::{Router, RoutingQuery};
+use crate::router::{Mode as RouteMode, Router, RoutingQuery};
 use crate::ui::skia::{RenderState, TextOptions};
 use crate::ui::view::{UiView, View};
 use crate::ui::{Button, Svg, TextField, Velocity, rect_contains};
@@ -62,11 +62,14 @@ pub struct SearchView {
     reference_point: GeoPoint,
     reference_zoom: u8,
     pending_reverse: bool,
+    last_route: Option<RoutingQuery>,
     route_origin: Option<GeoPoint>,
+    route_mode: RouteMode,
     route_active: bool,
     gps: Option<GeoPoint>,
 
     cancel_route_button: Button,
+    route_mode_button: Button,
     search_field: TextField,
     config_button: Button,
     search_button: Button,
@@ -122,6 +125,10 @@ impl SearchView {
         let point = Self::cancel_route_button_point(size, 1.);
         let cancel_route_button = Button::new(point, button_size, Svg::CancelRoute);
 
+        let route_mode = RouteMode::default();
+        let point = Self::route_mode_button_point(size, 1.);
+        let route_mode_button = Button::new(point, button_size, route_mode.svg());
+
         let search_size = Self::search_field_size(size, 1.);
         let point = Self::search_field_point(size, 1.);
         let mut search_field = TextField::new(event_loop.clone(), point, search_size, 1.);
@@ -129,12 +136,14 @@ impl SearchView {
 
         Ok(Self {
             cancel_route_button,
+            route_mode_button,
             config_button,
             search_button,
             search_field,
             back_button,
             event_loop,
             gps_button,
+            route_mode,
             bg_paint,
             geocoder,
             router,
@@ -153,6 +162,7 @@ impl SearchView {
             last_query: Default::default(),
             route_origin: Default::default(),
             route_active: Default::default(),
+            last_route: Default::default(),
             error: Default::default(),
             gps: Default::default(),
         })
@@ -227,6 +237,11 @@ impl SearchView {
     pub fn set_route_active(&mut self, active: bool) {
         self.dirty |= self.route_active != active;
         self.route_active = active;
+
+        // Clear route cache for travel mode resubmission.
+        if !active {
+            self.last_route = None;
+        }
     }
 
     /// Start a new route calculation.
@@ -238,7 +253,9 @@ impl SearchView {
         self.geocoder.reset();
 
         // Submit background query.
-        self.router.route(RoutingQuery::new(origin, target));
+        let query = RoutingQuery::new(origin, target, self.route_mode);
+        let route = self.last_route.insert(query);
+        self.router.route(*route);
     }
 
     /// Set origin for routing and start route target selection.
@@ -413,6 +430,18 @@ impl SearchView {
         Point::new(config_button_point.x, y)
     }
 
+    /// Physical location of the route travel mode button.
+    fn route_mode_button_point(size: Size, scale: f64) -> Point {
+        let config_button_point = Self::config_button_point(size, scale);
+        let padding = (OUTSIDE_PADDING as f64 * scale).round() as i32;
+        let button_size = Self::button_size(scale);
+
+        let y = config_button_point.y - button_size.height as i32 - padding;
+        let x = config_button_point.x - button_size.width as i32 - padding;
+
+        Point::new(x, y)
+    }
+
     /// Physical size of the back/search buttons.
     fn button_size(scale: f64) -> Size {
         Size::new(BUTTON_SIZE, BUTTON_SIZE) * scale
@@ -468,8 +497,9 @@ impl SearchView {
         self.results().is_empty() && !self.geocoder.searching() && !self.router.routing()
     }
 
-    /// Check whether the route cancellation button should be rendered.
-    fn show_cancel_route_button(&self) -> bool {
+    /// Check whether the route cancellation/travel mode buttons should be
+    /// rendered.
+    fn show_route_buttons(&self) -> bool {
         self.show_extra_buttons() && (self.route_origin.is_some() || self.route_active)
     }
 
@@ -639,8 +669,9 @@ impl UiView for SearchView {
         self.search_field.draw(config, &mut render_state, config.colors.alt_background);
 
         if self.show_extra_buttons() {
-            if self.show_cancel_route_button() {
+            if self.show_route_buttons() {
                 self.cancel_route_button.draw(&mut render_state, config.colors.alt_background);
+                self.route_mode_button.draw(&mut render_state, config.colors.alt_background);
             }
             if self.gps.is_some() {
                 self.gps_button.draw(&mut render_state, config.colors.alt_background);
@@ -678,6 +709,7 @@ impl UiView for SearchView {
         // Update UI elements.
 
         self.cancel_route_button.set_point(Self::cancel_route_button_point(size, self.scale));
+        self.route_mode_button.set_point(Self::route_mode_button_point(size, self.scale));
         self.config_button.set_point(Self::config_button_point(size, self.scale));
         self.search_button.set_point(Self::search_button_point(size, self.scale));
         self.back_button.set_point(Self::back_button_point(size, self.scale));
@@ -698,6 +730,9 @@ impl UiView for SearchView {
 
         self.cancel_route_button.set_point(Self::cancel_route_button_point(self.size, scale));
         self.cancel_route_button.set_size(button_size);
+
+        self.route_mode_button.set_point(Self::route_mode_button_point(self.size, scale));
+        self.route_mode_button.set_size(button_size);
 
         self.config_button.set_point(Self::config_button_point(self.size, scale));
         self.config_button.set_size(button_size);
@@ -743,8 +778,10 @@ impl UiView for SearchView {
         self.touch_state.action = if self.search_focused {
             self.search_field.touch_down(&self.input_config, time, point);
             TouchAction::SearchField
-        } else if self.show_cancel_route_button() && self.cancel_route_button.contains(point) {
+        } else if self.show_route_buttons() && self.cancel_route_button.contains(point) {
             TouchAction::CancelRoute
+        } else if self.show_route_buttons() && self.route_mode_button.contains(point) {
+            TouchAction::RouteMode
         } else if show_extra_buttons && self.gps.is_some() && self.gps_button.contains(point) {
             TouchAction::RouteGps
         } else if show_extra_buttons && self.config_button.contains(point) {
@@ -833,13 +870,29 @@ impl UiView for SearchView {
                 self.event_loop.insert_idle(|state| state.window.set_view(View::Download));
             },
             TouchAction::CancelRoute
-                if self.show_cancel_route_button()
+                if self.show_route_buttons()
                     && self.cancel_route_button.contains(removed.point) =>
             {
                 self.event_loop.insert_idle(|state| state.window.views.map().cancel_route());
                 self.route_active = false;
                 self.route_origin = None;
+                self.last_route = None;
                 self.dirty = true;
+            },
+            TouchAction::RouteMode
+                if self.show_route_buttons() && self.route_mode_button.contains(removed.point) =>
+            {
+                self.route_mode = match self.route_mode {
+                    RouteMode::Pedestrian => RouteMode::Auto,
+                    RouteMode::Auto => RouteMode::Pedestrian,
+                };
+                self.route_mode_button.set_svg(self.route_mode.svg());
+                self.dirty = true;
+
+                // Resubmit route if one is already active.
+                if let Some(query) = self.last_route {
+                    self.route(query.origin, query.target);
+                }
             },
             TouchAction::RouteGps
                 if self.show_extra_buttons() && self.gps_button.contains(removed.point) =>
@@ -978,6 +1031,7 @@ struct TouchSlot {
 enum TouchAction {
     SearchField,
     CancelRoute,
+    RouteMode,
     RouteGps,
     Search,
     Config,

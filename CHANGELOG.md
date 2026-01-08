@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+### Added
+
+- Button for switching between pedestrian/automobile routing modes
+
 ## 1.1.0 - 2026-01-05
 
 ### Added

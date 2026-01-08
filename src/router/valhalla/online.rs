@@ -11,7 +11,7 @@ use crate::Error;
 use crate::config::Config;
 use crate::geometry::GeoPoint;
 use crate::router::valhalla::RouteResponse;
-use crate::router::{RoutingQuery, RoutingUpdate};
+use crate::router::{Mode, RoutingQuery, RoutingUpdate};
 use crate::ui::view::search::QueryId;
 
 /// Valhalla API routing engine.
@@ -57,7 +57,7 @@ impl Router {
     async fn route(&mut self, query: RoutingQuery) -> Result<(), Error> {
         // Convert query to Valhalla routing request format.
         let locations = vec![query.origin, query.target];
-        let request = RouteRequest { locations, costing: Costing::Auto };
+        let request = RouteRequest { locations, costing: query.mode };
         let data = serde_json::to_string(&request)?;
 
         // Get routing results from Valhalla.
@@ -74,12 +74,5 @@ impl Router {
 #[derive(Serialize)]
 struct RouteRequest {
     locations: Vec<GeoPoint>,
-    costing: Costing,
-}
-
-/// Valhalla costing models.
-#[derive(Serialize)]
-#[serde(rename_all = "lowercase")]
-enum Costing {
-    Auto,
+    costing: Mode,
 }
