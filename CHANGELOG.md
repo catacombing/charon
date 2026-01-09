@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Button for switching between pedestrian/automobile routing modes
 
+### Changed
+
+- Swapped search and back button in search view
+
 ## 1.1.0 - 2026-01-05
 
 ### Added

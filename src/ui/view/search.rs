@@ -353,13 +353,13 @@ impl SearchView {
 
     /// Physical location of the search text field.
     fn search_field_point(size: Size, scale: f64) -> Point {
-        let back_button_point = Self::back_button_point(size, scale);
+        let search_button_point = Self::search_button_point(size, scale);
         let padding = (OUTSIDE_PADDING as f64 * scale).round() as i32;
         let button_width = Self::button_size(scale).width as i32;
 
-        let x = back_button_point.x + button_width + padding;
+        let x = search_button_point.x + button_width + padding;
 
-        Point::new(x, back_button_point.y)
+        Point::new(x, search_button_point.y)
     }
 
     /// Physical size of the search text field.
@@ -379,10 +379,9 @@ impl SearchView {
         let button_size = Self::button_size(scale);
         let physical_size = size * scale;
 
-        let x = (physical_size.width - button_size.width) as i32 - padding;
         let y = (physical_size.height - button_size.height) as i32 - padding;
 
-        Point::new(x, y)
+        Point::new(padding, y)
     }
 
     /// Physical location of the back button.
@@ -391,9 +390,10 @@ impl SearchView {
         let button_size = Self::button_size(scale);
         let physical_size = size * scale;
 
+        let x = (physical_size.width - button_size.width) as i32 - padding;
         let y = (physical_size.height - button_size.height) as i32 - padding;
 
-        Point::new(padding, y)
+        Point::new(x, y)
     }
 
     /// Physical location of the config button.
@@ -449,12 +449,12 @@ impl SearchView {
 
     /// Physical point of the bottommost search result entry.
     fn result_point(&self) -> Point {
-        let back_button_point = Self::back_button_point(self.size, self.scale);
+        let search_button_point = Self::search_button_point(self.size, self.scale);
         let outside_padding = (OUTSIDE_PADDING as f64 * self.scale).round() as i32;
         let result_size = self.result_size();
 
-        let x = back_button_point.x;
-        let y = back_button_point.y - outside_padding - result_size.height as i32;
+        let x = search_button_point.x;
+        let y = search_button_point.y - outside_padding - result_size.height as i32;
 
         Point::new(x, y)
     }
