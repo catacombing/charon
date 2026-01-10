@@ -243,6 +243,7 @@ impl GeoPoint {
     }
 
     /// Get a geographic point from tile index and offset.
+    #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn from_tile(tile: TileIndex, offset: Point) -> Self {
         let x_fract = offset.x as f64 / TILE_SIZE as f64;
         let x = (tile.x as f64 + x_fract) / 2f64.powi(tile.z as i32);
@@ -260,6 +261,7 @@ impl GeoPoint {
     }
 
     /// Convert this point to a position within a specific tile.
+    #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn tile(&self, zoom: u8) -> (TileIndex, Point) {
         let tile_count = (1 << zoom) as f64;
 
@@ -284,6 +286,7 @@ impl GeoPoint {
     ///
     /// This uses the haversine formula, which is inaccurate due to assuming the
     /// earth is round, but it should suffice for our purposes.
+    #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn distance(&self, other: Self) -> u32 {
         const EARTH_RADIUS: f64 = 6_371_000.;
 
@@ -318,6 +321,7 @@ where
 }
 
 /// Check if any point of a line lies within a rectangle.
+#[cfg_attr(feature = "profiling", profiling::function)]
 pub fn rect_intersects_line(
     rect_point: Point<f64>,
     rect_size: Size<f64>,

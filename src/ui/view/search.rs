@@ -62,10 +62,9 @@ pub struct SearchView {
     reference_point: GeoPoint,
     reference_zoom: u8,
     pending_reverse: bool,
-    last_route: Option<RoutingQuery>,
-    route_origin: Option<GeoPoint>,
+    active_route: Option<(RouteOrigin, GeoPoint)>,
+    route_origin: Option<RouteOrigin>,
     route_mode: RouteMode,
-    route_active: bool,
     gps: Option<GeoPoint>,
 
     cancel_route_button: Button,
@@ -160,9 +159,8 @@ impl SearchView {
             ime_focused: Default::default(),
             touch_state: Default::default(),
             last_query: Default::default(),
+            active_route: Default::default(),
             route_origin: Default::default(),
-            route_active: Default::default(),
-            last_route: Default::default(),
             error: Default::default(),
             gps: Default::default(),
         })
@@ -233,19 +231,28 @@ impl SearchView {
         self.search_field.set_text("");
     }
 
-    /// Set whether a route is currently available for cancellation.
-    pub fn set_route_active(&mut self, active: bool) {
-        self.dirty |= self.route_active != active;
-        self.route_active = active;
-
-        // Clear route cache for travel mode resubmission.
-        if !active {
-            self.last_route = None;
-        }
+    /// Set the origin and target of the current route, if one is active.
+    pub fn set_route(&mut self, route: Option<(RouteOrigin, GeoPoint)>) {
+        self.dirty |= self.active_route != route;
+        self.active_route = route;
     }
 
     /// Start a new route calculation.
-    fn route(&mut self, origin: GeoPoint, target: GeoPoint) {
+    pub fn route(&mut self, origin: RouteOrigin, target: GeoPoint) {
+        // Determine route origin and whether the route should be updated from GPS.
+        let (origin, is_gps_route) = match origin {
+            RouteOrigin::GeoPoint(origin) => (origin, false),
+            RouteOrigin::Gps => match self.gps {
+                Some(origin) => (origin, true),
+                // Reset routing if GPS routing was requested but we lost the GPS signal.
+                None => {
+                    self.route_origin = None;
+                    self.dirty = true;
+                    return;
+                },
+            },
+        };
+
         self.search_field.set_text("");
         self.route_origin = None;
         self.dirty = true;
@@ -254,12 +261,11 @@ impl SearchView {
 
         // Submit background query.
         let query = RoutingQuery::new(origin, target, self.route_mode);
-        let route = self.last_route.insert(query);
-        self.router.route(*route);
+        self.router.route(query, is_gps_route);
     }
 
     /// Set origin for routing and start route target selection.
-    fn set_route_origin(&mut self, origin: GeoPoint) {
+    fn set_route_origin(&mut self, origin: RouteOrigin) {
         self.route_origin = Some(origin);
         self.search_field.set_text("");
         self.geocoder.reset();
@@ -500,7 +506,7 @@ impl SearchView {
     /// Check whether the route cancellation/travel mode buttons should be
     /// rendered.
     fn show_route_buttons(&self) -> bool {
-        self.show_extra_buttons() && (self.route_origin.is_some() || self.route_active)
+        self.show_extra_buttons() && (self.route_origin.is_some() || self.active_route.is_some())
     }
 
     /// Get result at the specified location.
@@ -860,7 +866,7 @@ impl UiView for SearchView {
                 },
                 Some((&QueryResult { point, .. }, true)) => match self.route_origin {
                     Some(origin) => self.route(origin, point),
-                    None => self.set_route_origin(point),
+                    None => self.set_route_origin(point.into()),
                 },
                 None => (),
             },
@@ -874,9 +880,8 @@ impl UiView for SearchView {
                     && self.cancel_route_button.contains(removed.point) =>
             {
                 self.event_loop.insert_idle(|state| state.window.views.map().cancel_route());
-                self.route_active = false;
+                self.active_route = None;
                 self.route_origin = None;
-                self.last_route = None;
                 self.dirty = true;
             },
             TouchAction::RouteMode
@@ -890,8 +895,8 @@ impl UiView for SearchView {
                 self.dirty = true;
 
                 // Resubmit route if one is already active.
-                if let Some(query) = self.last_route {
-                    self.route(query.origin, query.target);
+                if let Some((origin, target)) = self.active_route {
+                    self.route(origin, target);
                 }
             },
             TouchAction::RouteGps
@@ -899,7 +904,7 @@ impl UiView for SearchView {
             {
                 match (self.gps, self.route_origin) {
                     (Some(gps), Some(origin)) => self.route(origin, gps),
-                    (Some(gps), None) => self.set_route_origin(gps),
+                    (Some(_), None) => self.set_route_origin(RouteOrigin::Gps),
                     (None, _) => (),
                 }
             },
@@ -1039,6 +1044,19 @@ enum TouchAction {
     Drag,
     #[default]
     Tap,
+}
+
+/// Routing origin point source.
+#[derive(PartialEq, Copy, Clone)]
+pub enum RouteOrigin {
+    GeoPoint(GeoPoint),
+    Gps,
+}
+
+impl From<GeoPoint> for RouteOrigin {
+    fn from(point: GeoPoint) -> Self {
+        Self::GeoPoint(point)
+    }
 }
 
 /// Get zoom level necessary to make an address fully or mostly visible.

@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - Button for switching between pedestrian/automobile routing modes
+- Automatic updates for routes with GPS origin
 
 ### Changed
 

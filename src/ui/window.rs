@@ -407,7 +407,7 @@ impl Window {
         if view == View::Search {
             let map_view = self.views.map();
             let reference_point = map_view.reference_point();
-            let route_active = map_view.route_active();
+            let active_route = map_view.active_route();
             let reference_zoom = map_view.zoom();
 
             // Ensure search reference point matches last map view position.
@@ -415,7 +415,7 @@ impl Window {
             search_view.set_reference(reference_point, reference_zoom);
 
             // Ensure search route status matches map state.
-            search_view.set_route_active(route_active);
+            search_view.set_route(active_route);
         }
 
         self.text_input_dirty = true;

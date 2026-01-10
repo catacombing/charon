@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::mem;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use calloop::channel::{self, Event};
 use calloop::timer::{TimeoutAction, Timer};
@@ -21,6 +21,7 @@ use crate::geometry::{self, GeoPoint, Point, Size, rect_intersects_line};
 use crate::router::Route;
 use crate::tiles::{MAX_ZOOM, TILE_SIZE, TileIndex, TileIter, Tiles};
 use crate::ui::skia::RenderState;
+use crate::ui::view::search::RouteOrigin;
 use crate::ui::view::{UiView, View};
 use crate::ui::{Button, Svg, Velocity};
 use crate::{Error, State};
@@ -58,6 +59,15 @@ const ROUTE_RESOLUTION: f64 = 15.;
 /// Percentage of route width used to center the map.
 const ROUTE_ZOOM_PADDING: f64 = 1.1;
 
+/// Maximum GPS distance to be considered ON the route.
+const MAX_GPS_ROUTE_DISTANCE: u32 = 15;
+
+/// Minimum distance before rerouting a GPS route.
+const MIN_GPS_REROUTE_DISTANCE: u32 = 30;
+
+/// Minimum duration between rerouting attempts.
+const MIN_REROUTE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Map rendering UI view.
 pub struct MapView {
     pending_tiles: Vec<TileIndex>,
@@ -66,7 +76,9 @@ pub struct MapView {
     gps_timeout: Option<RegistrationToken>,
     gps: Option<RenderGeoPoint>,
     poi: Option<RenderGeoPoint>,
-    route: Option<Vec<RenderGeoPoint>>,
+    route: Option<(Vec<RenderGeoPoint>, bool)>,
+    last_reroute: Instant,
+    rerouting: bool,
 
     cursor_tile: TileIndex,
     cursor_offset: Point,
@@ -149,6 +161,7 @@ impl MapView {
             tile_paint,
             tiles,
             size,
+            last_reroute: Instant::now(),
             input_config: config.input,
             dirty: true,
             scale: 1.,
@@ -157,6 +170,7 @@ impl MapView {
             touch_state: Default::default(),
             gps_timeout: Default::default(),
             gps_locked: Default::default(),
+            rerouting: Default::default(),
             route: Default::default(),
             gps: Default::default(),
             poi: Default::default(),
@@ -209,10 +223,12 @@ impl MapView {
     }
 
     /// Update the GPS indicator location.
+    #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn set_gps(&mut self, point: Option<GeoPoint>) {
         let point = point.map(RenderGeoPoint::from);
         match point {
-            Some(point) => {
+            // Handle changed GPS positions.
+            Some(point) if Some(point) != self.gps => {
                 // Cancel pending GPS removal on update.
                 if let Some(token) = self.gps_timeout.take() {
                     self.event_loop.remove(token);
@@ -224,8 +240,30 @@ impl MapView {
                     self.gps_locked = true;
                 }
 
-                self.dirty |= self.gps != Some(point);
+                // Update current route.
+                if let Some((route, true)) = &mut self.route {
+                    let (index, distance) = nearest_route_segment(route, point.point);
+
+                    // Update the route to remove segments already traveled.
+                    if distance <= MAX_GPS_ROUTE_DISTANCE && index > 0 {
+                        *route = route.split_off(index);
+                    }
+
+                    // Reroute if GPS is way off course.
+                    if !self.rerouting
+                        && distance >= MIN_GPS_REROUTE_DISTANCE
+                        && let Some(&target) = route.last()
+                        && self.last_reroute.elapsed() >= MIN_REROUTE_INTERVAL
+                    {
+                        self.rerouting = true;
+                        self.event_loop.insert_idle(move |state| {
+                            state.window.views.search().route(RouteOrigin::Gps, target.point);
+                        });
+                    }
+                }
+
                 self.gps = Some(point);
+                self.dirty = true;
             },
             // To avoid 'flickering' we only remove GPS after a period of inactivity.
             None if self.gps_timeout.is_none() => {
@@ -245,27 +283,46 @@ impl MapView {
                     .inspect_err(|err| error!("Failed to stage GPS removal timeout: {err}"))
                     .ok();
             },
-            None => (),
+            _ => (),
         }
     }
 
     /// Update the active route.
     #[cfg_attr(feature = "profiling", profiling::function)]
-    pub fn set_route(&mut self, route: Route) {
+    pub fn set_route(&mut self, route: Route, is_gps_route: bool) {
+        let had_gps_route = self.route.as_ref().is_some_and(|(_, is_gps_route)| *is_gps_route);
+
+        // Convert route from segments to renderable geographic points.
         let points = route
             .segments
             .into_iter()
             .flat_map(|segment| segment.points.into_iter().map(RenderGeoPoint::from))
             .collect();
-        self.route = Some(points);
+        self.route = Some((points, is_gps_route));
 
-        // Set viewport to show the entire route.
-        self.center_route();
+        // Lock and center new GPS route, or show entire non-GPS route.
+        if is_gps_route
+            && !had_gps_route
+            && let Some(gps) = self.gps
+        {
+            self.goto(gps.point, self.cursor_tile.z);
+            self.gps_locked = true;
+        } else if !is_gps_route {
+            self.center_route();
+        }
+
+        self.reset_reroute_timeout();
 
         // Clear POIs, since they're either part of the route or a distraction.
         self.poi = None;
 
         self.dirty = true;
+    }
+
+    /// Clear rerouting timeout.
+    pub fn reset_reroute_timeout(&mut self) {
+        self.last_reroute = Instant::now();
+        self.rerouting = false;
     }
 
     /// Clear the active route.
@@ -274,9 +331,14 @@ impl MapView {
         self.route = None;
     }
 
-    /// Check whether a route is currently present.
-    pub fn route_active(&self) -> bool {
-        self.route.is_some()
+    /// Get current route's origin and target, if present.
+    pub fn active_route(&self) -> Option<(RouteOrigin, GeoPoint)> {
+        let (route, is_gps_route) = self.route.as_ref()?;
+        if *is_gps_route {
+            Some((RouteOrigin::Gps, route.last()?.point))
+        } else {
+            Some((route.first()?.point.into(), route.last()?.point))
+        }
     }
 
     /// Touch long-press callback.
@@ -489,10 +551,11 @@ impl MapView {
         // While in theory the start and end might not be the furthest point apart from
         // each other, this should work in most scenarios and avoids having to
         // determine maximum bounds for all points in the route.
-        let (start, end) = match self.route.as_ref().and_then(|r| Some((r.first()?, r.last()?))) {
-            Some((start, end)) => (start.point, end.point),
-            None => return,
-        };
+        let (start, end) =
+            match self.route.as_ref().and_then(|(r, _)| Some((r.first()?, r.last()?))) {
+                Some((start, end)) => (start.point, end.point),
+                None => return,
+            };
 
         // Calculate center point of the route.
         let center_lat = (start.lat + end.lat) / 2.;
@@ -679,7 +742,7 @@ impl UiView for MapView {
         }
 
         // Draw current route segments.
-        if let Some(route) = &mut self.route {
+        if let Some((route, _)) = &mut self.route {
             #[cfg(feature = "profiling")]
             profiling::scope!("draw_route");
 
@@ -1076,5 +1139,308 @@ impl RenderGeoPoint {
 impl From<GeoPoint> for RenderGeoPoint {
     fn from(point: GeoPoint) -> Self {
         Self { point, cached: Default::default() }
+    }
+}
+
+/// Find the segment in a route closest to a point.
+///
+/// A segment is defined as two consecutive nodes. The first and last node are
+/// part of one segment, all other nodes are part of two segments.
+///
+/// When multiple solutions have identical distances, this will always return
+/// the segment with the highest indices.
+#[cfg_attr(feature = "profiling", profiling::function)]
+fn nearest_route_segment(route: &[RenderGeoPoint], point: GeoPoint) -> (usize, u32) {
+    let mut min_naive_distance = f64::MAX;
+    let mut min_nearest = None;
+    let mut min_index = 0;
+
+    // Abort search if we're no longer finding any closer nodes.
+    const MAX_BAD_SEGMENTS: usize = 15;
+    let mut bad_segments = 0;
+
+    // Find segment with smallest distance.
+    for i in 1..route.len() {
+        // Get approximate flat earth distance to the segment.
+        let nearest = nearest_point(route[i - 1].point, route[i].point, point);
+        let delta_lat = (point.lat - nearest.lat).powi(2);
+        let delta_lon = (point.lon - nearest.lon).powi(2);
+        let distance = delta_lat + delta_lon;
+
+        // Update smallest found segment.
+        if distance <= min_naive_distance {
+            min_naive_distance = distance;
+            min_nearest = Some(nearest);
+            min_index = i - 1;
+        } else {
+            bad_segments += 1;
+        }
+
+        if bad_segments > MAX_BAD_SEGMENTS {
+            break;
+        }
+    }
+
+    match min_nearest {
+        Some(min_nearest) => (min_index, min_nearest.distance(point)),
+        // Ignore routes with no segments.
+        None => (0, u32::MAX),
+    }
+}
+
+/// Get the closest point on a segment for a point.
+///
+/// This does not take the earth's curvature into account,
+/// so it will be inaccurate for long segments.
+fn nearest_point(start: GeoPoint, end: GeoPoint, point: GeoPoint) -> GeoPoint {
+    // Handle zero-length segments.
+    if start == end {
+        return start;
+    }
+
+    // Use squared segment length, to avoid sqrt.
+    let squared_lat = (end.lat - start.lat).powi(2);
+    let squared_lon = (end.lon - start.lon).powi(2);
+    let squared_length = squared_lat + squared_lon;
+
+    // Calculate distance between start and end for the projection point.
+    let projection_distance = ((point.lat - start.lat) * (end.lat - start.lat)
+        + (point.lon - start.lon) * (end.lon - start.lon))
+        / squared_length;
+
+    // Clamp projection point distance on segment between start and end.
+    let projection_distance = projection_distance.clamp(0., 1.);
+
+    // Get position of the projection point.
+    let projection_point_lat = start.lat + projection_distance * (end.lat - start.lat);
+    let projection_point_lon = start.lon + projection_distance * (end.lon - start.lon);
+    GeoPoint::new(projection_point_lat, projection_point_lon)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nearest_segment_broken_route() {
+        let (index, distance) = nearest_route_segment(&[], GeoPoint::new(0., 0.));
+        assert_eq!(distance, u32::MAX);
+        assert_eq!(index, 0);
+
+        let (index, distance) =
+            nearest_route_segment(&[GeoPoint::new(10., 10.).into()], GeoPoint::new(0., 0.));
+        assert_eq!(distance, u32::MAX);
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn nearest_segment_tiny_route() {
+        let route = vec![GeoPoint::new(1., 1.).into(), GeoPoint::new(0., 0.).into()];
+        let (index, distance) = nearest_route_segment(&route, GeoPoint::new(0., 0.));
+        assert_eq!(distance, 0);
+        assert_eq!(index, 0);
+
+        let route = vec![GeoPoint::new(0., 0.).into(), GeoPoint::new(1., 1.).into()];
+        let (index, distance) = nearest_route_segment(&route, GeoPoint::new(0., 0.));
+        assert_eq!(distance, 0);
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn nearest_segment_edge_segment() {
+        let route = vec![
+            GeoPoint::new(0., 0.).into(),
+            GeoPoint::new(2., 2.).into(),
+            GeoPoint::new(3., 3.).into(),
+        ];
+        let (index, distance) = nearest_route_segment(&route, GeoPoint::new(0., 0.));
+        assert_eq!(distance, distance);
+        assert_eq!(index, 0);
+
+        let route = vec![
+            GeoPoint::new(3., 3.).into(),
+            GeoPoint::new(2., 2.).into(),
+            GeoPoint::new(1., 1.).into(),
+        ];
+        let (index, distance) = nearest_route_segment(&route, GeoPoint::new(0., 0.));
+        assert_eq!(distance, distance);
+        assert_eq!(index, 1);
+    }
+
+    #[test]
+    fn nearest_segment_center() {
+        let route = vec![
+            GeoPoint::new(-1., -1.).into(),
+            GeoPoint::new(0., 0.).into(),
+            GeoPoint::new(0.5, 0.5).into(),
+            GeoPoint::new(1.5, 1.5).into(),
+        ];
+        let (index, distance) = nearest_route_segment(&route, GeoPoint::new(0., 0.));
+        assert_eq!(distance, 0);
+        assert_eq!(index, 1);
+    }
+
+    #[test]
+    fn nearest_segment_local_optima() {
+        let route = vec![
+            GeoPoint::new(5., 5.).into(),
+            GeoPoint::new(4., 4.).into(),
+            GeoPoint::new(3., 3.).into(),
+            GeoPoint::new(99., 99.).into(), //  !
+            GeoPoint::new(99., 99.).into(),
+            GeoPoint::new(99., 99.).into(), // +2
+            GeoPoint::new(99., 99.).into(),
+            GeoPoint::new(99., 99.).into(),
+            GeoPoint::new(99., 99.).into(),
+            GeoPoint::new(0., 0.).into(), //   +4
+            GeoPoint::new(99., 99.).into(),
+        ];
+        let (index, distance) = nearest_route_segment(&route, GeoPoint::new(0., 0.));
+        assert_eq!(distance, 0);
+        assert_eq!(index, 9);
+
+        let route = vec![
+            GeoPoint::new(5., 5.).into(),
+            GeoPoint::new(4., 4.).into(),
+            GeoPoint::new(3., 3.).into(),
+            GeoPoint::new(99., 99.).into(), //  !
+            GeoPoint::new(99., 99.).into(),
+            GeoPoint::new(99., 99.).into(), // +2
+            GeoPoint::new(-1., -1.).into(),
+            GeoPoint::new(0., 0.).into(),
+            GeoPoint::new(1., 1.).into(),
+            GeoPoint::new(2., 2.).into(), //  + 4
+            GeoPoint::new(99., 99.).into(),
+        ];
+        let (index, distance) = nearest_route_segment(&route, GeoPoint::new(0., 0.));
+        assert_eq!(distance, 0);
+        assert_eq!(index, 7);
+    }
+
+    #[test]
+    fn nearest_segment_identical_nodes() {
+        let route = vec![GeoPoint::new(0., 0.).into(); 10];
+        let (index, distance) = nearest_route_segment(&route, GeoPoint::new(0., 0.));
+        assert_eq!(distance, 0);
+        assert_eq!(index, 8);
+    }
+
+    #[test]
+    fn nearest_segment_equal_distance_separate_nodes() {
+        let route = vec![
+            GeoPoint::new(9., 9.).into(),
+            GeoPoint::new(1., 1.).into(),
+            GeoPoint::new(1., -1.).into(),
+            GeoPoint::new(-1., -1.).into(),
+            GeoPoint::new(-1., 1.).into(),
+            GeoPoint::new(1., 1.).into(),
+            GeoPoint::new(9., 9.).into(),
+        ];
+        let origin = GeoPoint::new(0., 0.);
+        let (index, distance) = nearest_route_segment(&route, origin);
+        assert_eq!(distance, origin.distance(GeoPoint::new(0., 1.)));
+        assert_eq!(index, 4);
+    }
+
+    #[test]
+    fn nearest_segment_closer_segment_farther_node() {
+        let route = vec![
+            GeoPoint::new(0., 0.).into(),
+            GeoPoint::new(10., 0.).into(),
+            GeoPoint::new(10., 3.).into(),
+            GeoPoint::new(5., 3.).into(),
+            GeoPoint::new(99., 99.).into(),
+        ];
+
+        let origin = GeoPoint::new(5., 0.);
+        let (index, distance) = nearest_route_segment(&route, origin);
+        assert_eq!(distance, 0);
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn nearest_segment_parallel() {
+        let route = vec![
+            GeoPoint::new(0., 0.).into(),
+            GeoPoint::new(1., 0.).into(),
+            GeoPoint::new(2., 0.).into(),
+            GeoPoint::new(3., 0.).into(),
+            GeoPoint::new(4., 0.).into(),
+        ];
+
+        let origin = GeoPoint::new(0., 1.);
+        let (index, distance) = nearest_route_segment(&route, origin);
+        assert_eq!(distance, GeoPoint::new(0., 0.).distance(origin));
+        assert_eq!(index, 0);
+
+        let origin = GeoPoint::new(2.5, 1.);
+        let (index, distance) = nearest_route_segment(&route, origin);
+        assert_eq!(distance, GeoPoint::new(2.5, 0.).distance(origin));
+        assert_eq!(index, 2);
+
+        let origin = GeoPoint::new(4., 1.);
+        let (index, distance) = nearest_route_segment(&route, origin);
+        assert_eq!(distance, GeoPoint::new(4., 0.).distance(origin));
+        assert_eq!(index, 3);
+    }
+
+    #[test]
+    fn nearest_segment_on_route() {
+        let route = vec![
+            GeoPoint::new(0., 0.).into(),
+            GeoPoint::new(1., 0.).into(),
+            GeoPoint::new(2., 0.).into(),
+            GeoPoint::new(3., 0.).into(),
+            GeoPoint::new(4., 0.).into(),
+        ];
+
+        let (index, distance) = nearest_route_segment(&route, GeoPoint::new(0., 0.));
+        assert_eq!(distance, 0);
+        assert_eq!(index, 0);
+
+        let (index, distance) = nearest_route_segment(&route, GeoPoint::new(2.5, 0.));
+        assert_eq!(distance, 0);
+        assert_eq!(index, 2);
+
+        let (index, distance) = nearest_route_segment(&route, GeoPoint::new(4., 0.));
+        assert_eq!(distance, 0);
+        assert_eq!(index, 3);
+    }
+
+    #[test]
+    fn nearest_segment_beyond_route() {
+        let route = vec![
+            GeoPoint::new(0., 0.).into(),
+            GeoPoint::new(1., 0.).into(),
+            GeoPoint::new(2., 0.).into(),
+        ];
+
+        let origin = GeoPoint::new(-1., 0.);
+        let (index, distance) = nearest_route_segment(&route, GeoPoint::new(-1., 0.));
+        assert_eq!(distance, route[0].point.distance(origin));
+        assert_eq!(index, 0);
+
+        let origin = GeoPoint::new(3., 0.);
+        let (index, distance) = nearest_route_segment(&route, GeoPoint::new(3., 0.));
+        assert_eq!(distance, route[2].point.distance(origin));
+        assert_eq!(index, 1);
+    }
+
+    #[test]
+    fn nearest_segment_real_route() {
+        let route = vec![
+            GeoPoint::new(51.504314, 7.058997).into(),
+            GeoPoint::new(51.504311, 7.059138).into(),
+            GeoPoint::new(51.504311, 7.059178).into(),
+            GeoPoint::new(51.504311, 7.059279).into(),
+            GeoPoint::new(51.504311, 7.059279).into(),
+            GeoPoint::new(51.503564, 7.059259).into(),
+        ];
+        let origin = GeoPoint::new(51.504086, 7.0592);
+
+        let (index, distance) = nearest_route_segment(&route, origin);
+
+        assert_eq!(distance, 5);
+        assert_eq!(index, 4);
     }
 }

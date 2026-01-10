@@ -31,6 +31,7 @@ pub struct Router {
     client: Client,
 
     last_query: QueryId,
+    is_gps_route: bool,
     valhalla_offline_routing: bool,
     valhalla_online_routing: bool,
 }
@@ -58,8 +59,15 @@ impl Router {
             match query_event {
                 // Finish routing when any result is found, since only one result is returned.
                 RoutingUpdate::Route(route) => {
-                    state.window.views.map().set_route(route);
+                    router.valhalla_offline_routing = false;
+                    router.valhalla_online_routing = false;
+                    router.last_query = QueryId::new();
+
+                    let is_gps_route = router.is_gps_route;
+                    state.window.views.map().set_route(route, is_gps_route);
                     state.window.set_view(View::Map);
+                    state.window.unstall();
+
                     return;
                 },
                 // Mark current Valhalla online routing as done.
@@ -70,6 +78,9 @@ impl Router {
 
             // Show error if no route was found.
             if !router.routing() {
+                // Allow new rerouting attempts for GPS routes.
+                state.window.views.map().reset_reroute_timeout();
+
                 state.window.views.search().set_error("No Route Found");
                 state.window.unstall();
             }
@@ -92,11 +103,13 @@ impl Router {
             valhalla_offline_query_tx: Default::default(),
             valhalla_offline_routing: Default::default(),
             valhalla_online_routing: Default::default(),
+            is_gps_route: Default::default(),
         })
     }
 
     /// Submit a routing query to all engines.
-    pub fn route(&mut self, query: RoutingQuery) {
+    pub fn route(&mut self, query: RoutingQuery, is_gps_route: bool) {
+        self.is_gps_route = is_gps_route;
         self.last_query = query.id;
 
         if let Some(query_tx) = &self.valhalla_online_query_tx {
