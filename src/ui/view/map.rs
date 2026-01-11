@@ -242,23 +242,30 @@ impl MapView {
 
                 // Update current route.
                 if let Some((route, true)) = &mut self.route {
-                    let (index, distance) = nearest_route_segment(route, point.point);
-
-                    // Update the route to remove segments already traveled.
-                    if distance <= MAX_GPS_ROUTE_DISTANCE && index > 0 {
-                        *route = route.split_off(index);
-                    }
-
-                    // Reroute if GPS is way off course.
-                    if !self.rerouting
-                        && distance >= MIN_GPS_REROUTE_DISTANCE
-                        && let Some(&target) = route.last()
-                        && self.last_reroute.elapsed() >= MIN_REROUTE_INTERVAL
+                    if let Some(last) = route.last()
+                        && point.point.distance(last.point) <= MAX_GPS_ROUTE_DISTANCE
                     {
-                        self.rerouting = true;
-                        self.event_loop.insert_idle(move |state| {
-                            state.window.views.search().route(RouteOrigin::Gps, target.point);
-                        });
+                        // Delete route once it has been completed.
+                        self.cancel_route();
+                    } else {
+                        let (index, distance) = nearest_route_segment(route, point.point);
+
+                        // Update the route to remove segments already traveled.
+                        if distance <= MAX_GPS_ROUTE_DISTANCE && index > 0 {
+                            *route = route.split_off(index);
+                        }
+
+                        // Reroute if GPS is way off course.
+                        if !self.rerouting
+                            && distance >= MIN_GPS_REROUTE_DISTANCE
+                            && let Some(&target) = route.last()
+                            && self.last_reroute.elapsed() >= MIN_REROUTE_INTERVAL
+                        {
+                            self.rerouting = true;
+                            self.event_loop.insert_idle(move |state| {
+                                state.window.views.search().route(RouteOrigin::Gps, target.point);
+                            });
+                        }
                     }
                 }
 
