@@ -5,8 +5,8 @@ use serde::{Deserialize, Deserializer};
 use tracing::debug;
 
 use crate::Error;
-use crate::geometry::GeoPoint;
 use crate::router::{self, Route, RoutingUpdate, Segment};
+use crate::ui::view::map::RenderGeoPoint;
 use crate::ui::view::search::QueryId;
 
 pub mod offline;
@@ -69,7 +69,7 @@ struct Trip {
 struct Leg {
     maneuvers: Vec<Maneuver>,
     #[serde(deserialize_with = "deserialize_shape")]
-    shape: Vec<GeoPoint>,
+    shape: Vec<RenderGeoPoint>,
 }
 
 /// Maneuver in a Valhalla leg.
@@ -84,7 +84,7 @@ struct Maneuver {
 
 impl Maneuver {
     /// Convert this maneuver to a segment.
-    fn segment(&self, shape: &[GeoPoint]) -> Option<Segment> {
+    fn segment(self, shape: &[RenderGeoPoint]) -> Option<Segment> {
         if self.begin_shape_index >= shape.len() || self.end_shape_index >= shape.len() {
             return None;
         }
@@ -106,7 +106,7 @@ struct Summary {
 }
 
 /// Deserialize a Valhalla shape polyline.
-fn deserialize_shape<'de, D>(deserializer: D) -> Result<Vec<GeoPoint>, D::Error>
+fn deserialize_shape<'de, D>(deserializer: D) -> Result<Vec<RenderGeoPoint>, D::Error>
 where
     D: Deserializer<'de>,
 {

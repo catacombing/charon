@@ -54,7 +54,7 @@ const GPS_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTE_WIDTH: f32 = 10.;
 
 /// Square of the minimum physical distance between a route's path segments.
-const ROUTE_RESOLUTION: f64 = 15.;
+const ROUTE_RESOLUTION: f32 = 15.;
 
 /// Percentage of route width used to center the map.
 const ROUTE_ZOOM_PADDING: f64 = 1.1;
@@ -184,7 +184,7 @@ impl MapView {
 
     /// Get the geographic reference point for geocoding.
     pub fn reference_point(&self) -> GeoPoint {
-        match self.gps {
+        match &self.gps {
             Some(gps) => gps.point,
             None => GeoPoint::from_tile(self.cursor_tile, self.cursor_offset),
         }
@@ -228,7 +228,7 @@ impl MapView {
         let point = point.map(RenderGeoPoint::from);
         match point {
             // Handle changed GPS positions.
-            Some(point) if Some(point) != self.gps => {
+            Some(point) if Some(&point) != self.gps.as_ref() => {
                 // Cancel pending GPS removal on update.
                 if let Some(token) = self.gps_timeout.take() {
                     self.event_loop.remove(token);
@@ -258,12 +258,13 @@ impl MapView {
                         // Reroute if GPS is way off course.
                         if !self.rerouting
                             && distance >= MIN_GPS_REROUTE_DISTANCE
-                            && let Some(&target) = route.last()
+                            && let Some(target) = route.last()
                             && self.last_reroute.elapsed() >= MIN_REROUTE_INTERVAL
                         {
+                            let target = target.point;
                             self.rerouting = true;
                             self.event_loop.insert_idle(move |state| {
-                                state.window.views.search().route(RouteOrigin::Gps, target.point);
+                                state.window.views.search().route(RouteOrigin::Gps, target);
                             });
                         }
                     }
@@ -300,17 +301,13 @@ impl MapView {
         let had_gps_route = self.route.as_ref().is_some_and(|(_, is_gps_route)| *is_gps_route);
 
         // Convert route from segments to renderable geographic points.
-        let points = route
-            .segments
-            .into_iter()
-            .flat_map(|segment| segment.points.into_iter().map(RenderGeoPoint::from))
-            .collect();
+        let points = route.segments.into_iter().flat_map(|segment| segment.points).collect();
         self.route = Some((points, is_gps_route));
 
         // Lock and center new GPS route, or show entire non-GPS route.
         if is_gps_route
             && !had_gps_route
-            && let Some(gps) = self.gps
+            && let Some(gps) = &self.gps
         {
             self.goto(gps.point, self.cursor_tile.z);
             self.gps_locked = true;
@@ -711,7 +708,7 @@ impl UiView for MapView {
         let border_size = fill_size + INDICATOR_BORDER * self.scale as f32;
 
         // Draw POI rectangle.
-        let poi_tile = self.poi.map(|mut poi| poi.tile(self.cursor_tile.z));
+        let poi_tile = self.poi.as_mut().map(|poi| poi.tile(self.cursor_tile.z));
         let poi_point = poi_tile.and_then(|(tile, offset)| iter.screen_point(tile, offset));
         if let Some(point) = poi_point {
             // Draw circle border.
@@ -736,7 +733,7 @@ impl UiView for MapView {
         }
 
         // Draw GPS circle.
-        let gps_tile = self.gps.map(|mut gps| gps.tile(self.cursor_tile.z));
+        let gps_tile = self.gps.as_mut().map(|gps| gps.tile(self.cursor_tile.z));
         let gps_point = gps_tile.and_then(|(tile, offset)| iter.screen_point(tile, offset));
         if let Some(point) = gps_point {
             // Draw circle border.
@@ -753,40 +750,44 @@ impl UiView for MapView {
             #[cfg(feature = "profiling")]
             profiling::scope!("draw_route");
 
-            // Ensure route color is up to date.
-            self.route_paint.set_color4f(Color4f::from(config.colors.highlight), None);
-
             let mut path = PathBuilder::new();
-            let mut skipped = true;
-            let mut omitted = 0;
+            let route_len = route.len(); // TODO: Get rid of this?
+            let mut last_node = None;
 
             // Add path segments for all visible route sections.
-            let size: Size<f64> = size.into();
-            for i in 1..route.len() {
-                let (start_tile, start_offset) = route[i - omitted - 1].tile(self.cursor_tile.z);
-                let start_point = iter.tile_point(start_tile, start_offset).into();
+            let size = size.into();
+            for (i, node) in route.iter_mut().enumerate().skip(1) {
+                // Get screen position for the node.
+                let (tile, offset) = node.tile(self.cursor_tile.z);
+                let end_point: Point<f32> = iter.tile_point(tile, offset).into();
 
-                let (end_tile, end_offset) = route[i].tile(self.cursor_tile.z);
-                let end_point = iter.tile_point(end_tile, end_offset).into();
+                // If the path was broken, move to the new point without drawing anything.
+                let start_point = match last_node {
+                    Some(start_point) => start_point,
+                    None => {
+                        last_node = Some(end_point);
+                        path.move_to(end_point);
+                        continue;
+                    },
+                };
 
-                let delta: Point<f64> = start_point - end_point;
+                // Omit point if it is too close to the last one, unless it's the final point.
+                let delta = start_point - end_point;
+                if i < route_len && delta.x.hypot(delta.y) < ROUTE_RESOLUTION {
+                    continue;
+                }
 
-                if i + 1 < route.len() && delta.x.hypot(delta.y) < ROUTE_RESOLUTION {
-                    // If a point is too close to the last one, omit it.
-                    omitted += 1;
-                } else if rect_intersects_line(Point::default(), size, start_point, end_point) {
-                    // Draw visible route segments.
-                    if mem::take(&mut skipped) {
-                        path.move_to(start_point);
-                    }
+                // Draw visible route segments, or break the path.
+                if rect_intersects_line(Point::default(), size, start_point, end_point) {
+                    last_node = Some(end_point);
                     path.line_to(end_point);
-                    omitted = 0;
                 } else {
-                    // Skip invisible segments, breaking the path.
-                    skipped = true;
-                    omitted = 0;
+                    last_node = None;
                 }
             }
+
+            // Ensure route color is up to date.
+            self.route_paint.set_color4f(Color4f::from(config.colors.highlight), None);
 
             // Draw the entire path.
             render_state.draw_path(&path.detach(), &self.route_paint);
@@ -1127,8 +1128,11 @@ enum TouchAction {
 }
 
 /// Geographic point with a tile location cache.
-#[derive(PartialEq, Copy, Clone)]
-struct RenderGeoPoint {
+///
+/// XXX: This is intentionally not `Copy`, to avoid accidentally updating the
+/// cache of a copy rather than the cached point.
+#[derive(PartialEq, Clone, Debug)]
+pub struct RenderGeoPoint {
     point: GeoPoint,
     cached: Option<(TileIndex, Point)>,
 }

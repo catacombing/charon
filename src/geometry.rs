@@ -323,10 +323,10 @@ where
 /// Check if any point of a line lies within a rectangle.
 #[cfg_attr(feature = "profiling", profiling::function)]
 pub fn rect_intersects_line(
-    rect_point: Point<f64>,
-    rect_size: Size<f64>,
-    line_start: Point<f64>,
-    line_end: Point<f64>,
+    rect_point: Point<f32>,
+    rect_size: Size<f32>,
+    line_start: Point<f32>,
+    line_end: Point<f32>,
 ) -> bool {
     let max_point = rect_point + Point::new(rect_size.width, rect_size.height);
 
@@ -341,10 +341,10 @@ pub fn rect_intersects_line(
 
 /// Check if two lines intersect
 fn lines_intersect(
-    a_start: Point<f64>,
-    a_end: Point<f64>,
-    b_start: Point<f64>,
-    b_end: Point<f64>,
+    a_start: Point<f32>,
+    a_end: Point<f32>,
+    b_start: Point<f32>,
+    b_end: Point<f32>,
 ) -> bool {
     let a_width = a_end.x - a_start.x;
     let a_height = a_end.y - a_start.y;
@@ -369,7 +369,7 @@ fn lines_intersect(
 }
 
 /// Check if a line contains a point.
-fn line_contains(line_start: Point<f64>, line_end: Point<f64>, point: Point<f64>) -> bool {
+fn line_contains(line_start: Point<f32>, line_end: Point<f32>, point: Point<f32>) -> bool {
     point.x <= line_start.x.max(line_end.x)
         && point.x >= line_start.x.min(line_end.x)
         && point.y <= line_start.y.max(line_end.y)
