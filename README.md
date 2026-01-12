@@ -30,7 +30,6 @@ The following noteworthy features are currently supported:
 The following features are **not** supported yet, but are on the roadmap:
 
  - Bulk tile download for offline rendering
- - Offline Valhalla routing
  - Turn-by-turn navigation (voice instructions might be out of scope)
 
 ## Building from Source
