@@ -79,3 +79,20 @@ impl Router {
         route.submit(query.id, &self.result_tx, "Offline")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valhalla_config() {
+        // Ensure Valhalla config is up to date.
+        let config = Config::from_json(VALHALLA_CONFIG).unwrap();
+        match Actor::new(&config) {
+            Ok(_) => (),
+            // If a tile load is attempted, the config parsed fine.
+            Err(err) if err.to_string() == "Failed to load tileset" => (),
+            Err(err) => panic!("Valhalla config error: {err}"),
+        }
+    }
+}
