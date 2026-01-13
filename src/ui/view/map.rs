@@ -978,11 +978,11 @@ impl UiView for MapView {
         // Render attribution message.
         self.draw_attribution(config, &mut render_state);
 
-        // Render active POI and GPS symbols.
-        self.draw_map_points(config, &mut render_state, &iter);
-
         // Render active route.
         self.draw_route(config, &mut render_state, &iter);
+
+        // Render active POI and GPS symbols.
+        self.draw_map_points(config, &mut render_state, &iter);
 
         // Render buttons.
         self.draw_buttons(config, &mut render_state);
