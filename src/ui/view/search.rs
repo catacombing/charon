@@ -20,7 +20,7 @@ use crate::geometry::{GeoPoint, Point, Size};
 use crate::region::Regions;
 use crate::router::{Mode as RouteMode, Router, RoutingQuery};
 use crate::ui::skia::{RenderState, TextOptions};
-use crate::ui::view::{UiView, View};
+use crate::ui::view::{self, UiView, View};
 use crate::ui::{Button, Svg, TextField, Velocity, rect_contains};
 use crate::{Error, State};
 
@@ -314,7 +314,7 @@ impl SearchView {
                 let mut text =
                     String::with_capacity(result.entity_type.len() + " · XXXXX km".len());
                 let _ = write!(&mut text, "{} · ", result.entity_type);
-                format_distance(&mut text, distance);
+                view::format_distance(&mut text, distance);
                 Cow::Owned(text)
             },
             None => Cow::Borrowed(result.entity_type),
@@ -1067,17 +1067,4 @@ fn zoom_from_address(address: &str) -> u8 {
         2 | 3 => 11,
         _ => 18,
     }
-}
-
-/// Format a distance targeting 3 visible digits.
-fn format_distance(w: &mut impl Write, distance: u32) {
-    let (unit, divisor) = match distance {
-        ..1_000 => ("m", 1.),
-        _ => ("km", 1000.),
-    };
-
-    let distance = distance as f64 / divisor;
-    let precision = 2usize.saturating_sub(distance.log10() as usize);
-
-    let _ = write!(w, "{distance:.precision$} {unit}");
 }

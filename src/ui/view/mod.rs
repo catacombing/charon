@@ -1,6 +1,7 @@
 //! UI render views.
 
 use std::any::Any;
+use std::fmt::Write;
 use std::ops::{Deref, DerefMut};
 use std::slice::IterMut;
 
@@ -195,4 +196,17 @@ impl DerefMut for Views {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.views[self.active_view as usize]
     }
+}
+
+/// Format a distance targeting 3 visible digits.
+pub fn format_distance(w: &mut impl Write, distance: u32) {
+    let (unit, divisor) = match distance {
+        ..1_000 => ("m", 1.),
+        _ => ("km", 1000.),
+    };
+
+    let distance = distance as f64 / divisor;
+    let precision = 2usize.saturating_sub(distance.log10() as usize);
+
+    let _ = write!(w, "{distance:.precision$} {unit}");
 }

@@ -1,6 +1,7 @@
 //! Map rendering UI view.
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::mem;
 use std::time::{Duration, Instant};
@@ -9,6 +10,7 @@ use calloop::channel::{self, Event};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{LoopHandle, RegistrationToken};
 use reqwest::Client;
+use skia_safe::textlayout::TextAlign;
 use skia_safe::{
     Color4f, FilterMode, MipmapMode, Paint, PaintCap, PaintJoin, PathBuilder, Rect, SamplingOptions,
 };
@@ -20,9 +22,10 @@ use crate::dbus::modem_manager;
 use crate::geometry::{self, GeoPoint, Point, Size, rect_intersects_line};
 use crate::router::Route;
 use crate::tiles::{MAX_ZOOM, TILE_SIZE, TileIndex, TileIter, Tiles};
-use crate::ui::skia::RenderState;
+use crate::ui::skia::{RenderState, TextOptions};
+use crate::ui::view::map::route::MapRoute;
 use crate::ui::view::search::RouteOrigin;
-use crate::ui::view::{UiView, View};
+use crate::ui::view::{self, UiView, View};
 use crate::ui::{Button, Svg, Velocity};
 use crate::{Error, State};
 
@@ -33,7 +36,7 @@ const BUTTON_SIZE: u32 = 48;
 const BUTTON_PADDING: u32 = 16;
 
 /// Border size around the buttons at scale 1.
-const BUTTON_BORDER: f64 = 1.;
+const BUTTON_BORDER: f64 = 2.;
 
 /// Border size around the locked GPS button at scale 1.
 const LOCKED_GPS_BORDER: f64 = 4.;
@@ -46,6 +49,21 @@ const INDICATOR_SIZE: f32 = 10.;
 
 /// POI/GPS indicator border size at scale 1.
 const INDICATOR_BORDER: f32 = 4.;
+
+/// Padding around the instruction message box at scale 1.
+const INSTRUCTION_OUTSIDE_PADDING: f32 = 16.;
+
+/// Padding inside the instruction message box at scale 1.
+const INSTRUCTION_INSIDE_PADDING: f32 = 5.;
+
+/// Border size around the instruction message box at scale 1.
+const INSTRUCTION_BORDER: f64 = 2.;
+
+/// Main instruction font size relative to the default.
+const INSTRUCTION_FONT_SIZE: f32 = 1.2;
+
+/// Instruction distance/time font size relative to the default.
+const INSTRUCTION_ALT_FONT_SIZE: f32 = 0.75;
 
 /// Time after losing GPS signal before GPS indicator is removed.
 const GPS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -76,7 +94,7 @@ pub struct MapView {
     gps_timeout: Option<RegistrationToken>,
     gps: Option<RenderGeoPoint>,
     poi: Option<RenderGeoPoint>,
-    route: Option<(Vec<RenderGeoPoint>, bool)>,
+    route: Option<MapRoute>,
     last_reroute: Instant,
     rerouting: bool,
 
@@ -177,6 +195,293 @@ impl MapView {
         })
     }
 
+    /// Render all visible tiles.
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn draw_tiles<'a>(&mut self, render_state: &mut RenderState<'a>, iter: &mut TileIter) {
+        let tile_size = iter.tile_size() as f32;
+
+        for (index, point) in iter {
+            // Get image for this tile.
+            let image = match self.tiles.get(index).image() {
+                Some(image) => image,
+                // If the image hasn't loaded yet, add it to the pending tiles.
+                None => {
+                    self.pending_tiles.push(index);
+                    continue;
+                },
+            };
+
+            #[cfg(feature = "profiling")]
+            profiling::scope!("draw_tile_image");
+
+            // Calculate tile's destination rectangle.
+            let (x, y) = (point.x as f32, point.y as f32);
+            let dst_rect = Rect::new(x, y, x + tile_size, y + tile_size);
+
+            let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::Linear);
+            render_state.draw_image_rect_with_sampling_options(
+                image,
+                None,
+                dst_rect,
+                sampling,
+                &self.tile_paint,
+            );
+        }
+    }
+
+    /// Render the attribution message
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn draw_attribution<'a>(&mut self, config: &Config, render_state: &mut RenderState<'a>) {
+        if config.tiles.attribution.is_empty() {
+            return;
+        }
+
+        let fg = config.colors.foreground;
+        let mut builder = render_state.paragraph(fg, ATTRIBUTION_FONT_SIZE, None);
+        builder.add_text(&*config.tiles.attribution);
+
+        let mut paragraph = builder.build();
+        paragraph.layout(self.size.width as f32 * self.scale as f32);
+        paragraph.paint(render_state, Point::new(0., 0.));
+    }
+
+    /// Render active POI and GPS symbols.
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn draw_map_points<'a>(
+        &mut self,
+        config: &Config,
+        render_state: &mut RenderState<'a>,
+        iter: &TileIter,
+    ) {
+        let fill_size = INDICATOR_SIZE * self.scale as f32;
+        let border_size = fill_size + INDICATOR_BORDER * self.scale as f32;
+
+        // Draw POI rectangle.
+        let poi_tile = self.poi.as_mut().map(|poi| poi.tile(self.cursor_tile.z));
+        let poi_point = poi_tile.and_then(|(tile, offset)| iter.screen_point(tile, offset));
+        if let Some(point) = poi_point {
+            // Draw circle border.
+            self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
+            let rect = Rect::new(
+                point.x as f32 - border_size / 2.,
+                point.y as f32 - border_size / 2.,
+                point.x as f32 + border_size / 2.,
+                point.y as f32 + border_size / 2.,
+            );
+            render_state.draw_rect(rect, &self.tile_paint);
+
+            // Draw circle fill.
+            self.tile_paint.set_color4f(Color4f::from(config.colors.highlight), None);
+            let rect = Rect::new(
+                point.x as f32 - fill_size / 2.,
+                point.y as f32 - fill_size / 2.,
+                point.x as f32 + fill_size / 2.,
+                point.y as f32 + fill_size / 2.,
+            );
+            render_state.draw_rect(rect, &self.tile_paint);
+        }
+
+        // Draw GPS circle.
+        let gps_tile = self.gps.as_mut().map(|gps| gps.tile(self.cursor_tile.z));
+        let gps_point = gps_tile.and_then(|(tile, offset)| iter.screen_point(tile, offset));
+        if let Some(point) = gps_point {
+            // Draw circle border.
+            self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
+            render_state.draw_circle(point, border_size / 2., &self.tile_paint);
+
+            // Draw circle fill.
+            self.tile_paint.set_color4f(Color4f::from(config.colors.highlight), None);
+            render_state.draw_circle(point, fill_size / 2., &self.tile_paint);
+        }
+    }
+
+    /// Render active route.
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn draw_route<'a>(
+        &mut self,
+        config: &Config,
+        render_state: &mut RenderState<'a>,
+        iter: &TileIter,
+    ) {
+        let route = match &mut self.route {
+            Some(route) => route,
+            _ => return,
+        };
+
+        let size = (self.size * self.scale).into();
+
+        {
+            #[cfg(feature = "profiling")]
+            profiling::scope!("draw_route_segments");
+
+            let mut path = PathBuilder::new();
+            let route_len = route.len();
+            let mut last_node = None;
+
+            // Add path segments for all visible route sections.
+            for (i, node) in route.points_mut().iter_mut().enumerate().skip(1) {
+                // Get screen position for the node.
+                let (tile, offset) = node.tile(self.cursor_tile.z);
+                let end_point: Point<f32> = iter.tile_point(tile, offset).into();
+
+                // If the path was broken, move to the new point without drawing anything.
+                let start_point = match last_node {
+                    Some(start_point) => start_point,
+                    None => {
+                        last_node = Some(end_point);
+                        path.move_to(end_point);
+                        continue;
+                    },
+                };
+
+                // Omit point if it is too close to the last one, unless it's the final point.
+                let delta = start_point - end_point;
+                if i + 1 < route_len && delta.x.hypot(delta.y) < ROUTE_RESOLUTION {
+                    continue;
+                }
+
+                // Draw visible route segments, or break the path.
+                if rect_intersects_line(Point::default(), size, start_point, end_point) {
+                    last_node = Some(end_point);
+                    path.line_to(end_point);
+                } else {
+                    last_node = None;
+                }
+            }
+
+            // Ensure route color is up to date.
+            self.route_paint.set_color4f(Color4f::from(config.colors.highlight), None);
+
+            // Draw the entire path.
+            render_state.draw_path(&path.detach(), &self.route_paint);
+        }
+
+        // Draw instructions for GPS routes.
+        if route.has_gps_origin() {
+            #[cfg(feature = "profiling")]
+            profiling::scope!("draw_route_instruction");
+
+            let outside_padding = (INSTRUCTION_OUTSIDE_PADDING * self.scale as f32).round();
+            let inside_padding = (INSTRUCTION_INSIDE_PADDING * self.scale as f32).round();
+            let border = (INSTRUCTION_BORDER * self.scale).round() as f32;
+            let box_width = size.width - 2. * outside_padding;
+            let text_width = box_width - 2. * inside_padding - 2. * border;
+            let fg = config.colors.foreground;
+
+            let instruction = route.instruction();
+
+            // Layout all text, to determine the box height.
+
+            // Layout instruction text.
+
+            let text_options = Some(TextOptions::new().ellipsize(false));
+            let mut builder = render_state.paragraph(fg, INSTRUCTION_FONT_SIZE, text_options);
+            builder.add_text(instruction.text.trim_end_matches('.'));
+
+            let mut instruction_paragraph = builder.build();
+            instruction_paragraph.layout(text_width);
+            let instruction_height = instruction_paragraph.height();
+
+            // Layout travel time text.
+
+            let hours = instruction.time / 3600;
+            let minutes = (instruction.time % 3600 + 30) / 60;
+            let time_text = format!("{hours:0>2}:{minutes:0>2}");
+
+            let mut builder = render_state.paragraph(fg, INSTRUCTION_ALT_FONT_SIZE, None);
+            builder.add_text(&time_text);
+
+            let mut time_paragraph = builder.build();
+            time_paragraph.layout(text_width);
+            let time_height = time_paragraph.height();
+
+            // Layout travel distance text.
+
+            let mut distance = String::with_capacity("X.XX km".len());
+            view::format_distance(&mut distance, instruction.length);
+
+            let text_options = Some(TextOptions::new().align(TextAlign::Right));
+            let mut builder = render_state.paragraph(fg, INSTRUCTION_ALT_FONT_SIZE, text_options);
+            builder.add_text(&distance);
+
+            let mut distance_paragraph = builder.build();
+            distance_paragraph.layout(text_width);
+
+            // Calculate instruction message box height.
+            let box_height = instruction_height + time_height + 3. * inside_padding + 2. * border;
+
+            // Draw border around instruction message box.
+            let mut rect = Rect::new(
+                outside_padding,
+                outside_padding,
+                outside_padding + box_width,
+                outside_padding + box_height,
+            );
+            self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
+            render_state.draw_rect(rect, &self.tile_paint);
+
+            // Draw instruction message box background.
+            rect.left += border;
+            rect.top += border;
+            rect.right -= border;
+            rect.bottom -= border;
+            self.tile_paint.set_color4f(Color4f::from(config.colors.alt_background), None);
+            render_state.draw_rect(rect, &self.tile_paint);
+
+            // Draw all paragraphs.
+
+            let mut text_origin = Point::new(rect.left + inside_padding, rect.top + inside_padding);
+            instruction_paragraph.paint(render_state, text_origin);
+            text_origin.y += inside_padding + instruction_height;
+            time_paragraph.paint(render_state, text_origin);
+            distance_paragraph.paint(render_state, text_origin);
+        }
+    }
+
+    /// Render buttons.
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn draw_buttons<'a>(&mut self, config: &Config, render_state: &mut RenderState<'a>) {
+        let search_point: Point<f32> = Self::search_button_point(self.size, self.scale).into();
+        let button_size: Size<f32> = Self::button_size(self.scale).into();
+        let button_border = (BUTTON_BORDER * self.scale).round() as f32;
+        let bg = config.colors.background;
+
+        // Get visible buttons with their respective borders.
+        let button_points: &mut [_] = match self.gps {
+            Some(_) if self.gps_locked => {
+                let gps_point: Point<f32> = Self::gps_button_point(self.size, self.scale).into();
+
+                let gps_border = (LOCKED_GPS_BORDER * self.scale).round() as f32;
+                let search = (&mut self.search_button, search_point, button_border, bg);
+                let gps = (&mut self.gps_button, gps_point, gps_border, config.colors.highlight);
+                &mut [search, gps]
+            },
+            Some(_) => {
+                let gps_point: Point<f32> = Self::gps_button_point(self.size, self.scale).into();
+
+                &mut [
+                    (&mut self.search_button, search_point, button_border, bg),
+                    (&mut self.gps_button, gps_point, button_border, bg),
+                ]
+            },
+            None => &mut [(&mut self.search_button, search_point, button_border, bg)],
+        };
+
+        // Draw all buttons.
+        for (button, point, border_size, border_color) in button_points {
+            let search_left = point.x - *border_size;
+            let search_top = point.y - *border_size;
+            let search_right = point.x + button_size.width + *border_size;
+            let search_bottom = point.y + button_size.height + *border_size;
+            let border_rect = Rect::new(search_left, search_top, search_right, search_bottom);
+
+            self.tile_paint.set_color4f(Color4f::from(*border_color), None);
+            render_state.draw_rect(border_rect, &self.tile_paint);
+
+            button.draw(render_state, config.colors.alt_background);
+        }
+    }
+
     /// Access the tile storage.
     pub fn tiles(&self) -> &Tiles {
         &self.tiles
@@ -241,27 +546,28 @@ impl MapView {
                 }
 
                 // Update current route.
-                if let Some((route, true)) = &mut self.route {
-                    if let Some(last) = route.last()
-                        && point.point.distance(last.point) <= MAX_GPS_ROUTE_DISTANCE
+                if let Some(route) = &mut self.route
+                    && route.has_gps_origin()
+                {
+                    if let Some(last) = route.end()
+                        && point.point.distance(last) <= MAX_GPS_ROUTE_DISTANCE
                     {
                         // Delete route once it has been completed.
                         self.cancel_route();
                     } else {
-                        let (index, distance) = nearest_route_segment(route, point.point);
+                        let (index, distance) = nearest_route_segment(route.points(), point.point);
 
                         // Update the route to remove segments already traveled.
-                        if distance <= MAX_GPS_ROUTE_DISTANCE && index > 0 {
-                            *route = route.split_off(index);
+                        if distance <= MAX_GPS_ROUTE_DISTANCE {
+                            route.truncate_start(index);
                         }
 
                         // Reroute if GPS is way off course.
                         if !self.rerouting
                             && distance >= MIN_GPS_REROUTE_DISTANCE
-                            && let Some(target) = route.last()
+                            && let Some(target) = route.end()
                             && self.last_reroute.elapsed() >= MIN_REROUTE_INTERVAL
                         {
-                            let target = target.point;
                             self.rerouting = true;
                             self.event_loop.insert_idle(move |state| {
                                 state.window.views.search().route(RouteOrigin::Gps, target);
@@ -298,15 +604,14 @@ impl MapView {
     /// Update the active route.
     #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn set_route(&mut self, route: Route, is_gps_route: bool) {
-        let had_gps_route = self.route.as_ref().is_some_and(|(_, is_gps_route)| *is_gps_route);
-
-        // Convert route from segments to renderable geographic points.
-        let points = route.segments.into_iter().flat_map(|segment| segment.points).collect();
-        self.route = Some((points, is_gps_route));
+        // Update the current route.
+        let map_route = self.route.get_or_insert_default();
+        let was_gps_route = map_route.has_gps_origin();
+        map_route.set_route(route, is_gps_route);
 
         // Lock and center new GPS route, or show entire non-GPS route.
         if is_gps_route
-            && !had_gps_route
+            && !was_gps_route
             && let Some(gps) = &self.gps
         {
             self.goto(gps.point, self.cursor_tile.z);
@@ -337,11 +642,11 @@ impl MapView {
 
     /// Get current route's origin and target, if present.
     pub fn active_route(&self) -> Option<(RouteOrigin, GeoPoint)> {
-        let (route, is_gps_route) = self.route.as_ref()?;
-        if *is_gps_route {
-            Some((RouteOrigin::Gps, route.last()?.point))
+        let route = self.route.as_ref()?;
+        if route.has_gps_origin() {
+            Some((RouteOrigin::Gps, route.end()?))
         } else {
-            Some((route.first()?.point.into(), route.last()?.point))
+            Some((route.start()?.into(), route.end()?))
         }
     }
 
@@ -555,11 +860,10 @@ impl MapView {
         // While in theory the start and end might not be the furthest point apart from
         // each other, this should work in most scenarios and avoids having to
         // determine maximum bounds for all points in the route.
-        let (start, end) =
-            match self.route.as_ref().and_then(|(r, _)| Some((r.first()?, r.last()?))) {
-                Some((start, end)) => (start.point, end.point),
-                None => return,
-            };
+        let (start, end) = match self.route.as_ref().and_then(|r| Some((r.end()?, r.start()?))) {
+            Some(points) => points,
+            None => return,
+        };
 
         // Calculate center point of the route.
         let center_lat = (start.lat + end.lat) / 2.;
@@ -662,174 +966,21 @@ impl UiView for MapView {
 
         // Create iterator over visible tiles.
         let mut iter = TileIter::new(size, self.cursor_tile, self.cursor_offset, self.zoom_scale());
-        let tile_size = iter.tile_size() as f32;
 
         // Render all visible tiles.
-        for (index, point) in &mut iter {
-            // Get image for this tile.
-            let image = match self.tiles.get(index).image() {
-                Some(image) => image,
-                // If the image hasn't loaded yet, add it to the pending tiles.
-                None => {
-                    self.pending_tiles.push(index);
-                    continue;
-                },
-            };
-
-            #[cfg(feature = "profiling")]
-            profiling::scope!("draw_tile_image");
-
-            // Calculate tile's destination rectangle.
-            let (x, y) = (point.x as f32, point.y as f32);
-            let dst_rect = Rect::new(x, y, x + tile_size, y + tile_size);
-
-            let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::Linear);
-            render_state.draw_image_rect_with_sampling_options(
-                image,
-                None,
-                dst_rect,
-                sampling,
-                &self.tile_paint,
-            );
-        }
+        self.draw_tiles(&mut render_state, &mut iter);
 
         // Render attribution message.
-        if !config.tiles.attribution.is_empty() {
-            let fg = config.colors.foreground;
-            let mut builder = render_state.paragraph(fg, ATTRIBUTION_FONT_SIZE, None);
-            builder.add_text(&*config.tiles.attribution);
+        self.draw_attribution(config, &mut render_state);
 
-            let mut paragraph = builder.build();
-            paragraph.layout(size.width as f32);
-            paragraph.paint(&render_state, Point::new(0., 0.));
-        }
+        // Render active POI and GPS symbols.
+        self.draw_map_points(config, &mut render_state, &iter);
 
-        let fill_size = INDICATOR_SIZE * self.scale as f32;
-        let border_size = fill_size + INDICATOR_BORDER * self.scale as f32;
+        // Render active route.
+        self.draw_route(config, &mut render_state, &iter);
 
-        // Draw POI rectangle.
-        let poi_tile = self.poi.as_mut().map(|poi| poi.tile(self.cursor_tile.z));
-        let poi_point = poi_tile.and_then(|(tile, offset)| iter.screen_point(tile, offset));
-        if let Some(point) = poi_point {
-            // Draw circle border.
-            self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
-            let rect = Rect::new(
-                point.x as f32 - border_size / 2.,
-                point.y as f32 - border_size / 2.,
-                point.x as f32 + border_size / 2.,
-                point.y as f32 + border_size / 2.,
-            );
-            render_state.draw_rect(rect, &self.tile_paint);
-
-            // Draw circle fill.
-            self.tile_paint.set_color4f(Color4f::from(config.colors.highlight), None);
-            let rect = Rect::new(
-                point.x as f32 - fill_size / 2.,
-                point.y as f32 - fill_size / 2.,
-                point.x as f32 + fill_size / 2.,
-                point.y as f32 + fill_size / 2.,
-            );
-            render_state.draw_rect(rect, &self.tile_paint);
-        }
-
-        // Draw GPS circle.
-        let gps_tile = self.gps.as_mut().map(|gps| gps.tile(self.cursor_tile.z));
-        let gps_point = gps_tile.and_then(|(tile, offset)| iter.screen_point(tile, offset));
-        if let Some(point) = gps_point {
-            // Draw circle border.
-            self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
-            render_state.draw_circle(point, border_size / 2., &self.tile_paint);
-
-            // Draw circle fill.
-            self.tile_paint.set_color4f(Color4f::from(config.colors.highlight), None);
-            render_state.draw_circle(point, fill_size / 2., &self.tile_paint);
-        }
-
-        // Draw current route segments.
-        if let Some((route, _)) = &mut self.route {
-            #[cfg(feature = "profiling")]
-            profiling::scope!("draw_route");
-
-            let mut path = PathBuilder::new();
-            let route_len = route.len(); // TODO: Get rid of this?
-            let mut last_node = None;
-
-            // Add path segments for all visible route sections.
-            let size = size.into();
-            for (i, node) in route.iter_mut().enumerate().skip(1) {
-                // Get screen position for the node.
-                let (tile, offset) = node.tile(self.cursor_tile.z);
-                let end_point: Point<f32> = iter.tile_point(tile, offset).into();
-
-                // If the path was broken, move to the new point without drawing anything.
-                let start_point = match last_node {
-                    Some(start_point) => start_point,
-                    None => {
-                        last_node = Some(end_point);
-                        path.move_to(end_point);
-                        continue;
-                    },
-                };
-
-                // Omit point if it is too close to the last one, unless it's the final point.
-                let delta = start_point - end_point;
-                if i < route_len && delta.x.hypot(delta.y) < ROUTE_RESOLUTION {
-                    continue;
-                }
-
-                // Draw visible route segments, or break the path.
-                if rect_intersects_line(Point::default(), size, start_point, end_point) {
-                    last_node = Some(end_point);
-                    path.line_to(end_point);
-                } else {
-                    last_node = None;
-                }
-            }
-
-            // Ensure route color is up to date.
-            self.route_paint.set_color4f(Color4f::from(config.colors.highlight), None);
-
-            // Draw the entire path.
-            render_state.draw_path(&path.detach(), &self.route_paint);
-        }
-
-        // Draw buttons with a border to distinguish them from the map.
-
-        let search_point: Point<f32> = Self::search_button_point(self.size, self.scale).into();
-        let gps_point: Point<f32> = Self::gps_button_point(self.size, self.scale).into();
-        let button_size: Size<f32> = Self::button_size(self.scale).into();
-        let button_border = (BUTTON_BORDER * self.scale).round() as f32;
-
-        let button_points: &mut [_] = match self.gps {
-            Some(_) if self.gps_locked => {
-                let gps_border = (LOCKED_GPS_BORDER * self.scale).round() as f32;
-                let bg = config.colors.background;
-                let search = (&mut self.search_button, search_point, button_border, bg);
-                let gps = (&mut self.gps_button, gps_point, gps_border, config.colors.highlight);
-                &mut [search, gps]
-            },
-            Some(_) => &mut [
-                (&mut self.search_button, search_point, button_border, config.colors.background),
-                (&mut self.gps_button, gps_point, button_border, config.colors.background),
-            ],
-            None => {
-                let bg = config.colors.background;
-                &mut [(&mut self.search_button, search_point, button_border, bg)]
-            },
-        };
-
-        for (button, point, border_size, border_color) in button_points {
-            let search_left = point.x - *border_size;
-            let search_top = point.y - *border_size;
-            let search_right = point.x + button_size.width + *border_size;
-            let search_bottom = point.y + button_size.height + *border_size;
-            let border_rect = Rect::new(search_left, search_top, search_right, search_bottom);
-
-            self.tile_paint.set_color4f(Color4f::from(*border_color), None);
-            render_state.draw_rect(border_rect, &self.tile_paint);
-
-            button.draw(&mut render_state, config.colors.alt_background);
-        }
+        // Render buttons.
+        self.draw_buttons(config, &mut render_state);
 
         // If no downloads are pending, pre-download tiles just outside the viewport.
         #[cfg(feature = "profiling")]
@@ -1132,7 +1283,7 @@ enum TouchAction {
 /// XXX: This is intentionally not `Copy`, to avoid accidentally updating the
 /// cache of a copy rather than the cached point.
 #[derive(PartialEq, Clone, Debug)]
-pub struct RenderGeoPoint {
+struct RenderGeoPoint {
     point: GeoPoint,
     cached: Option<(TileIndex, Point)>,
 }
@@ -1226,6 +1377,125 @@ fn nearest_point(start: GeoPoint, end: GeoPoint, point: GeoPoint) -> GeoPoint {
     let projection_point_lat = start.lat + projection_distance * (end.lat - start.lat);
     let projection_point_lon = start.lon + projection_distance * (end.lon - start.lon);
     GeoPoint::new(projection_point_lat, projection_point_lon)
+}
+
+/// Navigation instruction details.
+#[derive(Debug)]
+pub struct Instruction<'a> {
+    pub text: Cow<'a, str>,
+    /// Segment time in seconds.
+    pub time: u64,
+    /// Segment length in meters.
+    pub length: u32,
+}
+
+impl Instruction<'static> {
+    fn new(text: String, time: u64, length: u32) -> Self {
+        Self { text: Cow::Owned(text), time, length }
+    }
+}
+
+// Route module used to ensure [`MapRoute`] is not accessed directly.
+mod route {
+    use super::*;
+
+    /// Map route details.
+    #[derive(Default)]
+    pub struct MapRoute {
+        points: Vec<RenderGeoPoint>,
+        instructions: Vec<(usize, Instruction<'static>)>,
+        has_gps_origin: bool,
+        offset: usize,
+    }
+
+    impl MapRoute {
+        /// Update this route.
+        pub fn set_route(&mut self, route: Route, is_gps_route: bool) {
+            self.has_gps_origin = is_gps_route;
+            self.instructions.clear();
+            self.points.clear();
+
+            // Convert route from segments to renderable geographic points.
+            for segment in route.segments.into_iter() {
+                // Add instruction with its starting point index.
+                let instruction =
+                    Instruction::new(segment.instruction, segment.time, segment.length);
+                self.instructions.push((self.points.len(), instruction));
+
+                // Add all points for this segment.
+                self.points.extend(segment.points.into_iter().map(RenderGeoPoint::from));
+            }
+        }
+
+        /// Advance this route by `offset` points.
+        pub fn truncate_start(&mut self, offset: usize) {
+            self.offset = (self.offset + offset).min(self.points.len());
+        }
+
+        /// Check whether this route's origin was the user's GPS coordinate.
+        pub fn has_gps_origin(&self) -> bool {
+            self.has_gps_origin
+        }
+
+        /// Get the current route segment's instruction.
+        pub fn instruction(&self) -> Instruction<'_> {
+            let mut text = Cow::Borrowed("Error: No Instruction Found");
+            let mut start_index = 0;
+            let mut length = 0;
+            let mut time = 0;
+
+            for (i, instruction) in &self.instructions {
+                if *i <= self.offset {
+                    // Ensure instruction text is set if there is no next segment.
+                    text = Cow::Borrowed(&instruction.text);
+
+                    // Use time and length from the current segment.
+                    length = instruction.length;
+                    time = instruction.time;
+                    start_index = *i;
+                } else {
+                    // Use instruction text from the next segment if available.
+                    text = Cow::Borrowed(&instruction.text);
+
+                    // Approximate travelled distance/time by assuming every node is evenly spaced.
+                    let total_nodes = i - start_index;
+                    let completed_nodes = self.offset - start_index;
+                    let remaining = 1. - completed_nodes as f64 / total_nodes as f64;
+                    length = (length as f64 * remaining).round() as u32;
+                    time = (time as f64 * remaining).round() as u64;
+
+                    break;
+                }
+            }
+
+            Instruction { text, length, time }
+        }
+
+        /// Get the start of the route.
+        pub fn start(&self) -> Option<GeoPoint> {
+            Some(self.points[self.offset..].first()?.point)
+        }
+
+        /// Get the end of the route.
+        pub fn end(&self) -> Option<GeoPoint> {
+            Some(self.points[self.offset..].last()?.point)
+        }
+
+        /// Get immutable access to all points in the route.
+        pub fn points(&self) -> &[RenderGeoPoint] {
+            &self.points[self.offset..]
+        }
+
+        /// Get mutable access to all points in the route.
+        pub fn points_mut(&mut self) -> &mut [RenderGeoPoint] {
+            &mut self.points[self.offset..]
+        }
+
+        /// Get points remaining in this route.
+        pub fn len(&self) -> usize {
+            self.points[self.offset..].len()
+        }
+    }
 }
 
 #[cfg(test)]

@@ -15,7 +15,6 @@ use crate::router::valhalla::offline::Router as OfflineRouter;
 use crate::router::valhalla::online::Router as OnlineRouter;
 use crate::ui::skia::Svg;
 use crate::ui::view::View;
-use crate::ui::view::map::RenderGeoPoint;
 use crate::ui::view::search::QueryId;
 use crate::{Error, State};
 
@@ -215,18 +214,19 @@ pub struct Route {
 /// Subsection of a route.
 #[derive(Debug)]
 pub struct Segment {
-    pub points: Vec<RenderGeoPoint>,
+    pub points: Vec<GeoPoint>,
+    pub instruction: String,
     /// Segment time in seconds.
-    pub _time: u64,
-    /// Segment length in kilometers.
-    pub _length: f64,
+    pub time: u64,
+    /// Segment length in meters.
+    pub length: u32,
 }
 
 /// Decode a polyline string.
 ///
 /// See <https://developers.google.com/maps/documentation/utilities/polylinealgorithm>.
 /// See <https://valhalla.github.io/valhalla/decoding/>.
-fn decode_polyline(polyline: &str, precision: f64) -> Vec<RenderGeoPoint> {
+fn decode_polyline(polyline: &str, precision: f64) -> Vec<GeoPoint> {
     let mut shape = Vec::new();
 
     let mut chars = polyline.chars();
@@ -242,7 +242,7 @@ fn decode_polyline(polyline: &str, precision: f64) -> Vec<RenderGeoPoint> {
 
     while let Some((lat, lon)) = next_coordinates() {
         let point = GeoPoint::new(lat as f64 / precision, lon as f64 / precision);
-        shape.push(point.into());
+        shape.push(point);
     }
 
     shape
@@ -269,9 +269,9 @@ fn parse_polyline_coordinate(mut chars: impl Iterator<Item = char>, previous: i3
 fn decode_polyline5() {
     let x = decode_polyline("_p~iF~ps|U_ulLnnqC_mqNvxq`@", 1E5);
     let decoded = vec![
-        GeoPoint::new(38.5, -120.2).into(),
-        GeoPoint::new(40.7, -120.95).into(),
-        GeoPoint::new(43.252, -126.453).into(),
+        GeoPoint::new(38.5, -120.2),
+        GeoPoint::new(40.7, -120.95),
+        GeoPoint::new(43.252, -126.453),
     ];
     assert_eq!(x, decoded);
 }
@@ -279,9 +279,6 @@ fn decode_polyline5() {
 #[test]
 fn decode_polyline6() {
     let x = decode_polyline("e~epoA|jfpOiDaK", 1E6);
-    let decoded = vec![
-        GeoPoint::new(42.225139, -8.670911).into(),
-        GeoPoint::new(42.225224, -8.670718).into(),
-    ];
+    let decoded = vec![GeoPoint::new(42.225139, -8.670911), GeoPoint::new(42.225224, -8.670718)];
     assert_eq!(x, decoded);
 }
