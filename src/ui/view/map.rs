@@ -317,24 +317,25 @@ impl MapView {
             let mut path = PathBuilder::new();
             let route_len = route.len();
             let mut last_node = None;
+            let mut skipped = true;
 
             // Add path segments for all visible route sections.
-            for (i, node) in route.points_mut().iter_mut().enumerate().skip(1) {
+            for (i, node) in route.points_mut().iter_mut().enumerate() {
                 // Get screen position for the node.
                 let (tile, offset) = node.tile(self.cursor_tile.z);
                 let end_point: Point<f32> = iter.tile_point(tile, offset).into();
 
-                // If the path was broken, move to the new point without drawing anything.
+                // For the first node, just initialize `last_node`.
                 let start_point = match last_node {
                     Some(start_point) => start_point,
                     None => {
                         last_node = Some(end_point);
-                        path.move_to(end_point);
                         continue;
                     },
                 };
 
                 // Omit point if it is too close to the last one, unless it's the final point.
+                // This also skips the `last_node` update, to ensure the path is consistent.
                 let delta = start_point - end_point;
                 if i + 1 < route_len && delta.x.hypot(delta.y) < ROUTE_RESOLUTION {
                     continue;
@@ -342,11 +343,15 @@ impl MapView {
 
                 // Draw visible route segments, or break the path.
                 if rect_intersects_line(Point::default(), size, start_point, end_point) {
-                    last_node = Some(end_point);
+                    if mem::take(&mut skipped) {
+                        path.move_to(start_point);
+                    }
                     path.line_to(end_point);
                 } else {
-                    last_node = None;
+                    skipped = true;
                 }
+
+                last_node = Some(end_point);
             }
 
             // Ensure route color is up to date.
