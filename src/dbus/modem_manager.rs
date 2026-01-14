@@ -16,6 +16,9 @@ use zbus::{Connection, proxy};
 use crate::Error;
 use crate::geometry::GeoPoint;
 
+/// Minimum GPS refresh rate, since we don't want to poll too much.
+const MIN_GPS_REFRESH: Duration = Duration::from_secs(1);
+
 /// Listen for GPS location updates
 pub async fn gps_listen(tx: Sender<Option<GeoPoint>>) -> Result<(), Error> {
     let connection = Connection::system().await?;
@@ -136,7 +139,7 @@ async fn gps_refresh_rate(proxies: &[LocationProxy<'_>]) -> Option<Interval> {
         }
     }
 
-    min_secs.map(|secs| time::interval(Duration::from_secs(secs as u64)))
+    min_secs.map(|secs| time::interval(Duration::from_secs(secs as u64).max(MIN_GPS_REFRESH)))
 }
 
 /// Await GPS-related modem property changes.
