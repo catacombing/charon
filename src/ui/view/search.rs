@@ -859,7 +859,7 @@ impl UiView for SearchView {
                     let zoom = zoom_from_address(address);
                     self.event_loop.insert_idle(move |state| {
                         let map_view = state.window.views.map();
-                        map_view.goto(point, zoom);
+                        map_view.goto(point, Some(zoom));
                         map_view.set_poi(Some(point));
                         state.window.set_view(View::Map);
                     });

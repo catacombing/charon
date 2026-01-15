@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+### Changed
+
+- Default zoom on GPS location changed from level 19 to 18
+
 ### Fixed
 
 - Excessive polling/crashes with low ModemManager refresh rate

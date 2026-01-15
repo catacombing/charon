@@ -86,6 +86,9 @@ const MIN_GPS_REROUTE_DISTANCE: u32 = 30;
 /// Minimum duration between rerouting attempts.
 const MIN_REROUTE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Default zoom level for displaying GPS location.
+const GPS_ZOOM: u8 = 18;
+
 /// Map rendering UI view.
 pub struct MapView {
     pending_tiles: Vec<TileIndex>,
@@ -506,9 +509,15 @@ impl MapView {
     }
 
     /// Go to a specific coordinate.
-    pub fn goto(&mut self, point: GeoPoint, zoom: u8) {
-        let (cursor_tile, cursor_offset) = point.tile(zoom);
+    pub fn goto(&mut self, point: GeoPoint, zoom: Option<u8>) {
+        let tile_zoom = zoom.unwrap_or(self.cursor_tile.z);
+        let (cursor_tile, cursor_offset) = point.tile(tile_zoom);
         if self.cursor_tile != cursor_tile || self.cursor_offset != cursor_offset {
+            // Reset sub-tile zoom offset, if zoom level is changed.
+            if zoom.is_some() {
+                self.cursor_zoom = 0.;
+            }
+
             self.cursor_tile = cursor_tile;
             self.cursor_offset = cursor_offset;
             self.gps_locked = false;
@@ -546,7 +555,7 @@ impl MapView {
 
                 // Jump to new GPS position if the view is locked to the GPS.
                 if self.gps_locked {
-                    self.goto(point.point, self.cursor_tile.z);
+                    self.goto(point.point, None);
                     self.gps_locked = true;
                 }
 
@@ -619,7 +628,7 @@ impl MapView {
             && !was_gps_route
             && let Some(gps) = &self.gps
         {
-            self.goto(gps.point, self.cursor_tile.z);
+            self.goto(gps.point, Some(GPS_ZOOM));
             self.gps_locked = true;
         } else if !is_gps_route {
             self.center_route();
@@ -898,7 +907,7 @@ impl MapView {
         let height_zoom = geometry::zoom_for_distance(max_lat, height, size.height);
         let zoom = width_zoom.min(height_zoom);
 
-        self.goto(center, zoom);
+        self.goto(center, Some(zoom));
     }
 
     /// Create the GPS location background task.
@@ -1173,8 +1182,8 @@ impl UiView for MapView {
                         self.cursor_offset = offset;
                         self.cursor_tile = tile;
                         self.dirty = true;
-                    } else if self.cursor_tile.z != MAX_ZOOM {
-                        let (tile, offset) = point.tile(MAX_ZOOM);
+                    } else if self.cursor_tile.z != GPS_ZOOM {
+                        let (tile, offset) = point.tile(GPS_ZOOM);
                         self.cursor_offset = offset;
                         self.cursor_tile = tile;
                         self.dirty = true;
