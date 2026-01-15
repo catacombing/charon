@@ -94,7 +94,6 @@ pub struct MapView {
     pending_tiles: Vec<TileIndex>,
     tiles: Tiles,
 
-    gps_timeout: Option<RegistrationToken>,
     gps: Option<RenderGeoPoint>,
     poi: Option<RenderGeoPoint>,
     route: Option<MapRoute>,
@@ -189,7 +188,6 @@ impl MapView {
             pending_tiles: Default::default(),
             cursor_zoom: Default::default(),
             touch_state: Default::default(),
-            gps_timeout: Default::default(),
             gps_locked: Default::default(),
             rerouting: Default::default(),
             route: Default::default(),
@@ -541,75 +539,57 @@ impl MapView {
     /// Update the GPS indicator location.
     #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn set_gps(&mut self, point: Option<GeoPoint>) {
-        let point = point.map(RenderGeoPoint::from);
-        match point {
-            // Handle changed GPS positions.
-            Some(point) if Some(&point) != self.gps.as_ref() => {
-                // Cancel pending GPS removal on update.
-                if let Some(token) = self.gps_timeout.take() {
-                    self.event_loop.remove(token);
-                }
-
-                // Jump to new GPS position if the view is locked to the GPS.
-                if self.gps_locked {
-                    self.goto(point.point, None);
-                    self.gps_locked = true;
-                }
-
-                // Update current route.
-                if let Some(route) = &mut self.route
-                    && route.has_gps_origin()
-                {
-                    if let Some(last) = route.end()
-                        && point.point.distance(last) <= MAX_GPS_ROUTE_DISTANCE
-                    {
-                        // Delete route once it has been completed.
-                        self.cancel_route();
-                    } else {
-                        let (index, distance) = nearest_route_segment(route.points(), point.point);
-
-                        // Update the route to remove segments already traveled.
-                        if distance <= MAX_GPS_ROUTE_DISTANCE {
-                            route.truncate_start(index);
-                        }
-
-                        // Reroute if GPS is way off course.
-                        if !self.rerouting
-                            && distance >= MIN_GPS_REROUTE_DISTANCE
-                            && let Some(target) = route.end()
-                            && self.last_reroute.elapsed() >= MIN_REROUTE_INTERVAL
-                        {
-                            self.rerouting = true;
-                            self.event_loop.insert_idle(move |state| {
-                                state.window.views.search().route(RouteOrigin::Gps, target);
-                            });
-                        }
-                    }
-                }
-
-                self.gps = Some(point);
-                self.dirty = true;
+        let point = match point.map(RenderGeoPoint::from) {
+            // Ignore GPS positions matching the current state.
+            point if point.as_ref() == self.gps.as_ref() => return,
+            Some(point) => point,
+            None => {
+                self.dirty |= self.gps.is_some();
+                self.gps_locked = false;
+                self.gps = None;
+                return;
             },
-            // To avoid 'flickering' we only remove GPS after a period of inactivity.
-            None if self.gps_timeout.is_none() => {
-                let timer = Timer::from_duration(GPS_TIMEOUT);
-                let token = self.event_loop.insert_source(timer, move |_, _, state| {
-                    let map_view = state.window.views.map();
-                    map_view.dirty |= map_view.gps.is_some();
-                    map_view.gps_timeout = None;
-                    map_view.gps_locked = false;
-                    map_view.gps = None;
+        };
 
-                    state.window.unstall();
-
-                    TimeoutAction::Drop
-                });
-                self.gps_timeout = token
-                    .inspect_err(|err| error!("Failed to stage GPS removal timeout: {err}"))
-                    .ok();
-            },
-            _ => (),
+        // Jump to new GPS position if the view is locked to the GPS.
+        if self.gps_locked {
+            self.goto(point.point, None);
+            self.gps_locked = true;
         }
+
+        // Update current route.
+        if let Some(route) = &mut self.route
+            && route.has_gps_origin()
+        {
+            if let Some(last) = route.end()
+                && point.point.distance(last) <= MAX_GPS_ROUTE_DISTANCE
+            {
+                // Delete route once it has been completed.
+                self.cancel_route();
+            } else {
+                let (index, distance) = nearest_route_segment(route.points(), point.point);
+
+                // Update the route to remove segments already traveled.
+                if distance <= MAX_GPS_ROUTE_DISTANCE {
+                    route.truncate_start(index);
+                }
+
+                // Reroute if GPS is way off course.
+                if !self.rerouting
+                    && distance >= MIN_GPS_REROUTE_DISTANCE
+                    && let Some(target) = route.end()
+                    && self.last_reroute.elapsed() >= MIN_REROUTE_INTERVAL
+                {
+                    self.rerouting = true;
+                    self.event_loop.insert_idle(move |state| {
+                        state.window.views.search().route(RouteOrigin::Gps, target);
+                    });
+                }
+            }
+        }
+
+        self.gps = Some(point);
+        self.dirty = true;
     }
 
     /// Update the active route.
@@ -918,17 +898,40 @@ impl MapView {
             }
         });
 
-        // Forward new GPS locations to the maps view.
+        // Forward new GPS locations.
         event_loop.insert_source(gps_rx, |event, _, state| {
             let location = match event {
                 Event::Msg(location) => location,
                 Event::Closed => return,
             };
 
-            state.window.views.search().set_gps(location);
-            state.window.views.map().set_gps(location);
+            match location {
+                // Immediately forward new GPS locations.
+                Some(location) => {
+                    // Cancel pending GPS removal.
+                    if let Some(token) = state.gps_timeout.take() {
+                        state.event_loop.remove(token);
+                    }
 
-            state.window.unstall();
+                    state.window.views.search().set_gps(Some(location));
+                    state.window.views.map().set_gps(Some(location));
+                    state.window.unstall();
+                },
+                // Delay GPS removal by `GPS_TIMEOUT`.
+                None => {
+                    let timer = Timer::from_duration(GPS_TIMEOUT);
+                    let token = state.event_loop.insert_source(timer, move |_, _, state| {
+                        state.window.views.search().set_gps(None);
+                        state.window.views.map().set_gps(None);
+                        state.window.unstall();
+
+                        TimeoutAction::Drop
+                    });
+                    state.gps_timeout = token
+                        .inspect_err(|err| error!("Failed to stage GPS removal timeout: {err}"))
+                        .ok();
+                },
+            }
         })?;
 
         Ok(())

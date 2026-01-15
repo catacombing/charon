@@ -103,6 +103,9 @@ struct State {
 
     window: Window,
 
+    /// Calloop token for GPS removal timeout.
+    gps_timeout: Option<RegistrationToken>,
+
     terminated: bool,
 
     _config_manager: ConfigManager<ConfigEventHandler>,
@@ -137,6 +140,7 @@ impl State {
             window,
             _config_manager: config_manager,
             pointer_down: Default::default(),
+            gps_timeout: Default::default(),
             terminated: Default::default(),
             text_input: Default::default(),
             clipboard: Default::default(),
