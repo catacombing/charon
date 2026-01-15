@@ -663,12 +663,12 @@ impl UiView for SearchView {
             builder.add_text(msg);
 
             let mut paragraph = builder.build();
-            let outside_padding = (OUTSIDE_PADDING as f64 * self.scale).round();
-            paragraph.layout(size.width as f32 - outside_padding as f32);
+            let outside_padding = (OUTSIDE_PADDING as f64 * self.scale).round() as f32;
+            paragraph.layout(size.width as f32 - 2. * outside_padding);
 
             let result_end = results_start.y as f32 + result_size.height as f32;
             let y = (result_end - paragraph.height()) / 2.;
-            paragraph.paint(&render_state, Point::new(0., y));
+            paragraph.paint(&render_state, Point::new(outside_padding, y));
         }
 
         // Render input elements.

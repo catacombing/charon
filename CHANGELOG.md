@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Excessive polling/crashes with low ModemManager refresh rate
 - Search not using latest GPS coordinate as reference
+- Padding around search view status text
 
 ## 1.3.0 - 2026-01-13
 
