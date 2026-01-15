@@ -495,12 +495,9 @@ impl MapView {
         &self.tiles
     }
 
-    /// Get the geographic reference point for geocoding.
-    pub fn reference_point(&self) -> GeoPoint {
-        match &self.gps {
-            Some(gps) => gps.point,
-            None => GeoPoint::from_tile(self.cursor_tile, self.cursor_offset),
-        }
+    /// Get the current center point of the map.
+    pub fn center_point(&self) -> GeoPoint {
+        GeoPoint::from_tile(self.cursor_tile, self.cursor_offset)
     }
 
     /// Get the current tile zoom level.

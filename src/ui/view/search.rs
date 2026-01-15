@@ -59,8 +59,8 @@ pub struct SearchView {
     router: Router,
 
     last_query: String,
-    reference_point: GeoPoint,
-    reference_zoom: u8,
+    map_center_point: GeoPoint,
+    map_center_zoom: u8,
     pending_reverse: bool,
     active_route: Option<(RouteOrigin, GeoPoint)>,
     route_origin: Option<RouteOrigin>,
@@ -152,9 +152,9 @@ impl SearchView {
             dirty: true,
             scale: 1.,
             keyboard_focused: Default::default(),
+            map_center_point: Default::default(),
+            map_center_zoom: Default::default(),
             pending_reverse: Default::default(),
-            reference_point: Default::default(),
-            reference_zoom: Default::default(),
             scroll_offset: Default::default(),
             ime_focused: Default::default(),
             touch_state: Default::default(),
@@ -181,10 +181,10 @@ impl SearchView {
         self.dirty = true;
     }
 
-    /// Update the search reference point.
-    pub fn set_reference(&mut self, point: GeoPoint, zoom: u8) {
-        self.reference_point = point;
-        self.reference_zoom = zoom;
+    /// Update the map's center point.
+    pub fn set_map_center(&mut self, point: GeoPoint, zoom: u8) {
+        self.map_center_point = point;
+        self.map_center_zoom = zoom;
     }
 
     /// Update the current GPS location.
@@ -209,8 +209,9 @@ impl SearchView {
             self.geocoder.reset();
         } else {
             // Submit background query.
+            let reference_point = self.gps.unwrap_or(self.map_center_point);
             let mut query = SearchQuery::new(&self.last_query);
-            query.set_reference(self.reference_point, self.reference_zoom);
+            query.set_reference(reference_point, self.map_center_zoom);
             self.geocoder.search(query);
         }
 
