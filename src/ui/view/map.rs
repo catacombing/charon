@@ -1,6 +1,5 @@
 //! Map rendering UI view.
 
-use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::mem;
@@ -1215,10 +1214,6 @@ impl UiView for MapView {
             self.input_config = config.input;
             self.dirty = true;
         }
-    }
-
-    fn as_any(&mut self) -> &mut dyn Any {
-        self
     }
 }
 

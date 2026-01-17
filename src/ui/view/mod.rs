@@ -1,9 +1,7 @@
 //! UI render views.
 
-use std::any::Any;
 use std::fmt::Write;
 use std::ops::{Deref, DerefMut};
-use std::slice::IterMut;
 
 use calloop::LoopHandle;
 use reqwest::Client;
@@ -100,23 +98,22 @@ pub trait UiView {
 
     /// Handle config updates.
     fn update_config(&mut self, config: &Config);
-
-    fn as_any(&mut self) -> &mut dyn Any;
 }
 
 /// Available UI views.
-// XXX: Order **must** match the array order in `Views::new`.
 #[derive(Default, PartialEq, Eq, Copy, Clone, Debug)]
 pub enum View {
     #[default]
-    Map = 0,
-    Search = 1,
-    Download = 2,
+    Map,
+    Search,
+    Download,
 }
 
 /// UI view tracking.
 pub struct Views {
-    views: [Box<dyn UiView>; 3],
+    download: DownloadView,
+    search: SearchView,
+    map: MapView,
     active_view: View,
 }
 
@@ -139,23 +136,17 @@ impl Views {
         // Create geographic region manager.
         let regions = Regions::new(event_loop.clone(), client.clone(), db.clone())?;
 
-        let download_view =
-            Box::new(DownloadView::new(event_loop.clone(), config, regions.clone(), size)?);
-        let search_view = Box::new(SearchView::new(
-            event_loop.clone(),
-            client.clone(),
-            config,
-            regions.clone(),
-            size,
-        )?);
-        let map_view = Box::new(MapView::new(event_loop.clone(), client, db, config, size)?);
+        let download = DownloadView::new(event_loop.clone(), config, regions.clone(), size)?;
+        let search =
+            SearchView::new(event_loop.clone(), client.clone(), config, regions.clone(), size)?;
+        let map = MapView::new(event_loop.clone(), client, db, config, size)?;
 
-        Ok(Self { views: [map_view, search_view, download_view], active_view: Default::default() })
+        Ok(Self { download, search, map, active_view: Default::default() })
     }
 
     /// Get a mutable iterator over all views.
-    pub fn iter_mut(&mut self) -> IterMut<'_, Box<dyn UiView>> {
-        self.views.iter_mut()
+    pub fn views_mut(&mut self) -> [&mut dyn UiView; 3] {
+        [&mut self.map, &mut self.search, &mut self.download]
     }
 
     /// Update the active view.
@@ -165,17 +156,17 @@ impl Views {
 
     /// Get mutable access to the download view.
     pub fn download(&mut self) -> &mut DownloadView {
-        self.views[View::Download as usize].as_any().downcast_mut().unwrap()
+        &mut self.download
     }
 
     /// Get mutable access to the search view.
     pub fn search(&mut self) -> &mut SearchView {
-        self.views[View::Search as usize].as_any().downcast_mut().unwrap()
+        &mut self.search
     }
 
     /// Get mutable access to the map view.
     pub fn map(&mut self) -> &mut MapView {
-        self.views[View::Map as usize].as_any().downcast_mut().unwrap()
+        &mut self.map
     }
 
     /// Get the active view.
@@ -185,16 +176,24 @@ impl Views {
 }
 
 impl Deref for Views {
-    type Target = Box<dyn UiView>;
+    type Target = dyn UiView;
 
     fn deref(&self) -> &Self::Target {
-        &self.views[self.active_view as usize]
+        match self.active_view {
+            View::Download => &self.download,
+            View::Search => &self.search,
+            View::Map => &self.map,
+        }
     }
 }
 
 impl DerefMut for Views {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.views[self.active_view as usize]
+        match self.active_view {
+            View::Download => &mut self.download,
+            View::Search => &mut self.search,
+            View::Map => &mut self.map,
+        }
     }
 }
 

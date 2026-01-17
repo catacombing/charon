@@ -1,6 +1,5 @@
 //! Search UI view.
 
-use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -998,10 +997,6 @@ impl UiView for SearchView {
             self.input_config = config.input;
             self.dirty = true;
         }
-    }
-
-    fn as_any(&mut self) -> &mut dyn Any {
-        self
     }
 }
 

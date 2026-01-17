@@ -1,6 +1,5 @@
 //! Download UI view.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -663,10 +662,6 @@ impl UiView for DownloadView {
             .ok()
             .and_then(|path| fs::metadata(path).ok())
             .map_or(0, |metadata| metadata.len());
-    }
-
-    fn as_any(&mut self) -> &mut dyn Any {
-        self
     }
 }
 

@@ -178,7 +178,7 @@ impl Window {
         }
 
         // Update both active and inactive views.
-        for view in self.views.iter_mut() {
+        for view in self.views.views_mut() {
             view.set_size(size);
         }
 
@@ -206,7 +206,7 @@ impl Window {
         self.canvas.set_scale_factor(scale);
 
         // Update both active and inactive views.
-        for view in self.views.iter_mut() {
+        for view in self.views.views_mut() {
             view.set_scale_factor(scale);
         }
 
@@ -222,7 +222,7 @@ impl Window {
         self.canvas.update_config(&config);
 
         // Update both active and inactive views.
-        for view in self.views.iter_mut() {
+        for view in self.views.views_mut() {
             view.update_config(&config);
         }
 
@@ -262,7 +262,7 @@ impl Window {
 
     /// Handle keyboard focus.
     pub fn keyboard_enter(&mut self) {
-        for view in self.views.iter_mut() {
+        for view in self.views.views_mut() {
             view.keyboard_enter();
         }
 
@@ -273,7 +273,7 @@ impl Window {
 
     /// Handle keyboard focus loss.
     pub fn keyboard_leave(&mut self) {
-        for view in self.views.iter_mut() {
+        for view in self.views.views_mut() {
             view.keyboard_leave();
         }
 
@@ -304,7 +304,7 @@ impl Window {
     pub fn text_input_enter(&mut self, text_input: ZwpTextInputV3) {
         self.text_input = Some(text_input.into());
 
-        for view in self.views.iter_mut() {
+        for view in self.views.views_mut() {
             view.text_input_enter();
         }
 
@@ -317,7 +317,7 @@ impl Window {
     pub fn text_input_leave(&mut self) {
         self.text_input = None;
 
-        for view in self.views.iter_mut() {
+        for view in self.views.views_mut() {
             view.text_input_leave();
         }
 
