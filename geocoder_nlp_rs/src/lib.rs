@@ -91,6 +91,7 @@ impl Geocoder {
 
         geocoder.set_geocoder_path(geocoder_path)?;
         geocoder.geocoder.pin_mut().set_max_results(10);
+        geocoder.geocoder.pin_mut().set_max_queries_per_hierarchy(30);
 
         Ok(geocoder)
     }

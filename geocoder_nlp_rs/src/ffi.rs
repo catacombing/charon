@@ -13,6 +13,7 @@ mod ffi {
         fn new_geocoder() -> UniquePtr<Geocoder>;
         fn set_max_results(self: Pin<&mut Geocoder>, max_results: u64);
         fn get_max_results(self: &Geocoder) -> u64;
+        fn set_max_queries_per_hierarchy(self: Pin<&mut Geocoder>, max_queries_per_hierarchy: u64);
         fn load(self: Pin<&mut Geocoder>, dbname: &CxxString) -> bool;
         fn search(
             self: Pin<&mut Geocoder>,
