@@ -206,7 +206,10 @@ impl SearchView {
             self.geocoder.reset();
         } else {
             // Submit background query.
-            let reference_point = self.gps.unwrap_or(self.map_center_point);
+            let reference_point = match self.route_origin {
+                Some(RouteOrigin::Gps) | None => self.gps.unwrap_or(self.map_center_point),
+                Some(RouteOrigin::GeoPoint(point)) => point,
+            };
             let mut query = SearchQuery::new(&self.last_query);
             query.set_reference(reference_point, self.map_center_zoom);
             self.geocoder.search(query);
