@@ -61,7 +61,6 @@ pub struct SearchView {
     map_center_point: GeoPoint,
     map_center_zoom: u8,
     pending_reverse: bool,
-    active_route: Option<(RouteOrigin, GeoPoint)>,
     route_origin: Option<RouteOrigin>,
     route_mode: RouteMode,
     gps: Option<GeoPoint>,
@@ -158,7 +157,6 @@ impl SearchView {
             ime_focused: Default::default(),
             touch_state: Default::default(),
             last_query: Default::default(),
-            active_route: Default::default(),
             route_origin: Default::default(),
             error: Default::default(),
             gps: Default::default(),
@@ -231,14 +229,8 @@ impl SearchView {
         self.search_field.set_text("");
     }
 
-    /// Set the origin and target of the current route, if one is active.
-    pub fn set_route(&mut self, route: Option<(RouteOrigin, GeoPoint)>) {
-        self.dirty |= self.active_route != route;
-        self.active_route = route;
-    }
-
     /// Start a new route calculation.
-    pub fn route(&mut self, origin: RouteOrigin, target: GeoPoint) {
+    pub fn route(&mut self, origin: RouteOrigin, target: GeoPoint, mode: RouteMode) {
         // Determine route origin and whether the route should be updated from GPS.
         let (origin, is_gps_route) = match origin {
             RouteOrigin::GeoPoint(origin) => (origin, false),
@@ -260,7 +252,7 @@ impl SearchView {
         self.geocoder.reset();
 
         // Submit background query.
-        let query = RoutingQuery::new(origin, target, self.route_mode);
+        let query = RoutingQuery::new(origin, target, mode);
         self.router.route(query, is_gps_route);
     }
 
@@ -506,7 +498,7 @@ impl SearchView {
     /// Check whether the route cancellation/travel mode buttons should be
     /// rendered.
     fn show_route_buttons(&self) -> bool {
-        self.show_extra_buttons() && (self.route_origin.is_some() || self.active_route.is_some())
+        self.show_extra_buttons() && self.route_origin.is_some()
     }
 
     /// Get result at the specified location.
@@ -865,7 +857,7 @@ impl UiView for SearchView {
                     });
                 },
                 Some((&QueryResult { point, .. }, true)) => match self.route_origin {
-                    Some(origin) => self.route(origin, point),
+                    Some(origin) => self.route(origin, point, self.route_mode),
                     None => self.set_route_origin(point.into()),
                 },
                 None => (),
@@ -879,8 +871,6 @@ impl UiView for SearchView {
                 if self.show_route_buttons()
                     && self.cancel_route_button.contains(removed.point) =>
             {
-                self.event_loop.insert_idle(|state| state.window.views.map().cancel_route());
-                self.active_route = None;
                 self.route_origin = None;
                 self.dirty = true;
             },
@@ -893,17 +883,12 @@ impl UiView for SearchView {
                 };
                 self.route_mode_button.set_svg(self.route_mode.svg());
                 self.dirty = true;
-
-                // Resubmit route if one is already active.
-                if let Some((origin, target)) = self.active_route {
-                    self.route(origin, target);
-                }
             },
             TouchAction::RouteGps
                 if self.show_extra_buttons() && self.gps_button.contains(removed.point) =>
             {
                 match (self.gps, self.route_origin) {
-                    (Some(gps), Some(origin)) => self.route(origin, gps),
+                    (Some(gps), Some(origin)) => self.route(origin, gps, self.route_mode),
                     (Some(_), None) => self.set_route_origin(RouteOrigin::Gps),
                     (None, _) => (),
                 }

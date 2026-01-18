@@ -66,7 +66,7 @@ impl Router {
 
         let route: RouteResponse = response.json().await?;
 
-        route.submit(query.id, &self.result_tx, "Online")
+        route.submit(query, &self.result_tx, "Online")
     }
 }
 

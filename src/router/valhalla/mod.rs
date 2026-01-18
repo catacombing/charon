@@ -1,11 +1,13 @@
 //! Valhalla routing engines.
 
+use std::sync::Arc;
+
 use calloop::channel::Sender;
 use serde::{Deserialize, Deserializer};
 use tracing::debug;
 
 use crate::Error;
-use crate::router::{self, GeoPoint, Route, RoutingUpdate, Segment};
+use crate::router::{self, GeoPoint, Route, RoutingQuery, RoutingUpdate, Segment};
 use crate::ui::view::search::QueryId;
 
 pub mod offline;
@@ -23,7 +25,7 @@ struct RouteResponse {
 impl RouteResponse {
     fn submit(
         self,
-        id: QueryId,
+        query: RoutingQuery,
         result_tx: &Sender<(QueryId, RoutingUpdate)>,
         router: &'static str,
     ) -> Result<(), Error> {
@@ -35,9 +37,10 @@ impl RouteResponse {
 
         // Transform Valhalla response into Route.
         let mut response_route = Route {
-            _time: self.trip.summary.time.round() as u64,
-            _length: self.trip.summary.length,
+            time: self.trip.summary.time.round() as u64,
+            length: (self.trip.summary.length * 1_000.).round() as u32,
             segments: Vec::new(),
+            mode: query.mode,
         };
         for leg in self.trip.legs {
             for maneuver in leg.maneuvers {
@@ -48,7 +51,7 @@ impl RouteResponse {
         }
 
         // Submit result to the collector.
-        let _ = result_tx.send((id, RoutingUpdate::Route(response_route)));
+        let _ = result_tx.send((query.id, RoutingUpdate::Route(response_route)));
 
         Ok(())
     }
@@ -84,14 +87,19 @@ struct Maneuver {
 
 impl Maneuver {
     /// Convert this maneuver to a segment.
-    fn segment(self, shape: &[GeoPoint]) -> Option<Segment> {
+    fn segment(mut self, shape: &[GeoPoint]) -> Option<Segment> {
         if self.begin_shape_index >= shape.len() || self.end_shape_index >= shape.len() {
             return None;
         }
 
+        // Trim trailing full stop from Valhalla instructions, since it looks odd.
+        if self.instruction.ends_with('.') {
+            self.instruction.truncate(self.instruction.len() - 1);
+        }
+
         Some(Segment {
             points: shape[self.begin_shape_index..self.end_shape_index + 1].to_vec(),
-            instruction: self.instruction,
+            instruction: Arc::new(self.instruction),
             time: self.time.round() as u64,
             length: (self.length * 1_000.).round() as u32,
         })

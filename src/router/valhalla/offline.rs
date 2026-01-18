@@ -76,7 +76,7 @@ impl Router {
             _ => return Err(Error::ValhallaInvalidResponseType),
         };
 
-        route.submit(query.id, &self.result_tx, "Offline")
+        route.submit(query, &self.result_tx, "Offline")
     }
 }
 

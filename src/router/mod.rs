@@ -63,10 +63,15 @@ impl Router {
                     router.valhalla_online_routing = false;
                     router.last_query = QueryId::new();
 
+                    let route = Arc::new(route);
                     let is_gps_route = router.is_gps_route;
-                    state.window.views.map().set_route(route, is_gps_route);
-                    state.window.set_view(View::Map);
-                    state.window.unstall();
+                    state.window.views.map().set_route(route.clone(), is_gps_route);
+                    state.window.views.route().set_route(route, is_gps_route);
+                    if state.window.views.active() == View::Search {
+                        state.window.set_view(View::Map);
+                    } else {
+                        state.window.unstall();
+                    }
 
                     return;
                 },
@@ -172,7 +177,7 @@ impl RoutingQuery {
 }
 
 /// Routing travel modes.
-#[derive(Serialize, Default, Copy, Clone)]
+#[derive(Serialize, Default, Copy, Clone, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     // XXX: Integer values must match [`valhalla::proto::costing::Type`].
@@ -202,20 +207,22 @@ pub enum RoutingUpdate {
 }
 
 /// Routing result.
-#[derive(Debug)]
+#[derive(Default, Debug)]
 pub struct Route {
     pub segments: Vec<Segment>,
     /// Complete trip time in seconds.
-    pub _time: u64,
-    /// Complete trip length in kilometers.
-    pub _length: f64,
+    pub time: u64,
+    /// Complete trip length in meters.
+    pub length: u32,
+    /// Transportation mode.
+    pub mode: Mode,
 }
 
 /// Subsection of a route.
 #[derive(Debug)]
 pub struct Segment {
     pub points: Vec<GeoPoint>,
-    pub instruction: String,
+    pub instruction: Arc<String>,
     /// Segment time in seconds.
     pub time: u64,
     /// Segment length in meters.

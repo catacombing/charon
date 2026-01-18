@@ -407,15 +407,11 @@ impl Window {
         if view == View::Search {
             let map_view = self.views.map();
             let map_center_point = map_view.center_point();
-            let active_route = map_view.active_route();
             let map_center_zoom = map_view.zoom();
 
             // Ensure search reference point matches last map view position.
             let search_view = self.views.search();
             search_view.set_map_center(map_center_point, map_center_zoom);
-
-            // Ensure search route status matches map state.
-            search_view.set_route(active_route);
         }
 
         self.text_input_dirty = true;

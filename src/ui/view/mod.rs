@@ -14,11 +14,13 @@ use crate::region::Regions;
 use crate::ui::skia::RenderState;
 use crate::ui::view::download::DownloadView;
 use crate::ui::view::map::MapView;
+use crate::ui::view::route::RouteView;
 use crate::ui::view::search::SearchView;
 use crate::{Error, State};
 
 pub mod download;
 pub mod map;
+pub mod route;
 pub mod search;
 
 pub trait UiView {
@@ -105,6 +107,7 @@ pub trait UiView {
 pub enum View {
     #[default]
     Map,
+    Route,
     Search,
     Download,
 }
@@ -113,6 +116,7 @@ pub enum View {
 pub struct Views {
     download: DownloadView,
     search: SearchView,
+    route: RouteView,
     map: MapView,
     active_view: View,
 }
@@ -139,14 +143,15 @@ impl Views {
         let download = DownloadView::new(event_loop.clone(), config, regions.clone(), size)?;
         let search =
             SearchView::new(event_loop.clone(), client.clone(), config, regions.clone(), size)?;
+        let route = RouteView::new(event_loop.clone(), config, size)?;
         let map = MapView::new(event_loop.clone(), client, db, config, size)?;
 
-        Ok(Self { download, search, map, active_view: Default::default() })
+        Ok(Self { download, search, route, map, active_view: Default::default() })
     }
 
     /// Get a mutable iterator over all views.
-    pub fn views_mut(&mut self) -> [&mut dyn UiView; 3] {
-        [&mut self.map, &mut self.search, &mut self.download]
+    pub fn views_mut(&mut self) -> [&mut dyn UiView; 4] {
+        [&mut self.map, &mut self.route, &mut self.search, &mut self.download]
     }
 
     /// Update the active view.
@@ -162,6 +167,11 @@ impl Views {
     /// Get mutable access to the search view.
     pub fn search(&mut self) -> &mut SearchView {
         &mut self.search
+    }
+
+    /// Get mutable access to the route view.
+    pub fn route(&mut self) -> &mut RouteView {
+        &mut self.route
     }
 
     /// Get mutable access to the map view.
@@ -182,6 +192,7 @@ impl Deref for Views {
         match self.active_view {
             View::Download => &self.download,
             View::Search => &self.search,
+            View::Route => &self.route,
             View::Map => &self.map,
         }
     }
@@ -192,6 +203,7 @@ impl DerefMut for Views {
         match self.active_view {
             View::Download => &mut self.download,
             View::Search => &mut self.search,
+            View::Route => &mut self.route,
             View::Map => &mut self.map,
         }
     }

@@ -342,7 +342,7 @@ impl DownloadView {
             .saturating_sub(region_padding)
             + outside_padding;
 
-        // Calculate tab content outside the viewport.
+        // Calculate content outside the viewport.
         regions_height.saturating_sub(self.region_point().y as usize + region_height)
     }
 
@@ -393,9 +393,9 @@ impl UiView for DownloadView {
         // Calculate region list geometry.
 
         let padding = (REGION_Y_PADDING * self.scale).round() as i32;
+        let region_start = self.region_point();
         let region_size = self.region_size();
 
-        let region_start = self.region_point();
         let mut region_point = region_start;
         region_point.y += self.scroll_offset.round() as i32;
 
@@ -423,7 +423,7 @@ impl UiView for DownloadView {
         render_state.restore();
 
         let mut label_point: Point<f32> = self.installed_label_point().into();
-        let label_size = self.installed_label_size();
+        let label_size: Size<f32> = self.installed_label_size().into();
 
         // Layout tile storage size text if the toplevel region is displayed.
         let tiles_size_paragraph = (self.current_region[0] == usize::MAX).then(|| {
@@ -434,7 +434,7 @@ impl UiView for DownloadView {
             builder.add_text(&tiles_size_text);
 
             let mut paragraph = builder.build();
-            paragraph.layout(label_size.width as f32);
+            paragraph.layout(label_size.width);
 
             paragraph
         });
@@ -448,13 +448,13 @@ impl UiView for DownloadView {
         builder.add_text(&downloaded_text);
 
         let mut region_size_paragraph = builder.build();
-        region_size_paragraph.layout(label_size.width as f32);
+        region_size_paragraph.layout(label_size.width);
 
         // Draw text vertically centered in its space.
 
         let tiles_size_height = tiles_size_paragraph.as_ref().map_or(0., |p| p.height());
         let region_size_height = region_size_paragraph.height();
-        let y_offset = (label_size.height as f32 - region_size_height - tiles_size_height) / 2.;
+        let y_offset = (label_size.height - region_size_height - tiles_size_height) / 2.;
         label_point.y += y_offset;
 
         region_size_paragraph.paint(&render_state, label_point);

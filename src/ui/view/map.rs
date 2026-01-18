@@ -1,8 +1,8 @@
 //! Map rendering UI view.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::mem;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use calloop::channel::{self, Event};
@@ -19,7 +19,7 @@ use crate::config::{Config, Input};
 use crate::db::Db;
 use crate::dbus::modem_manager;
 use crate::geometry::{self, GeoPoint, Point, Size, rect_intersects_line};
-use crate::router::Route;
+use crate::router::{Mode as RouteMode, Route};
 use crate::tiles::{MAX_ZOOM, TILE_SIZE, TileIndex, TileIter, Tiles};
 use crate::ui::skia::{RenderState, TextOptions};
 use crate::ui::view::map::route::MapRoute;
@@ -381,7 +381,7 @@ impl MapView {
 
             let text_options = Some(TextOptions::new().ellipsize(false));
             let mut builder = render_state.paragraph(fg, INSTRUCTION_FONT_SIZE, text_options);
-            builder.add_text(instruction.text.trim_end_matches('.'));
+            builder.add_text(&*instruction.text);
 
             let mut instruction_paragraph = builder.build();
             instruction_paragraph.layout(text_width);
@@ -579,9 +579,10 @@ impl MapView {
                     && let Some(target) = route.end()
                     && self.last_reroute.elapsed() >= MIN_REROUTE_INTERVAL
                 {
+                    let mode = route.mode();
                     self.rerouting = true;
                     self.event_loop.insert_idle(move |state| {
-                        state.window.views.search().route(RouteOrigin::Gps, target);
+                        state.window.views.search().route(RouteOrigin::Gps, target, mode);
                     });
                 }
             }
@@ -593,7 +594,7 @@ impl MapView {
 
     /// Update the active route.
     #[cfg_attr(feature = "profiling", profiling::function)]
-    pub fn set_route(&mut self, route: Route, is_gps_route: bool) {
+    pub fn set_route(&mut self, route: Arc<Route>, is_gps_route: bool) {
         // Update the current route.
         let map_route = self.route.get_or_insert_default();
         let was_gps_route = map_route.has_gps_origin();
@@ -615,6 +616,9 @@ impl MapView {
         // Clear POIs, since they're either part of the route or a distraction.
         self.poi = None;
 
+        // Use search button for route overview while a route is active.
+        self.search_button.set_svg(Svg::Route);
+
         self.dirty = true;
     }
 
@@ -626,18 +630,9 @@ impl MapView {
 
     /// Clear the active route.
     pub fn cancel_route(&mut self) {
+        self.search_button.set_svg(Svg::Search);
         self.dirty |= self.route.is_some();
         self.route = None;
-    }
-
-    /// Get current route's origin and target, if present.
-    pub fn active_route(&self) -> Option<(RouteOrigin, GeoPoint)> {
-        let route = self.route.as_ref()?;
-        if route.has_gps_origin() {
-            Some((RouteOrigin::Gps, route.end()?))
-        } else {
-            Some((route.start()?.into(), route.end()?))
-        }
     }
 
     /// Touch long-press callback.
@@ -1166,9 +1161,10 @@ impl UiView for MapView {
                 self.touch_state.zoom_focus = removed.point;
                 self.zoom_by(2.);
             },
-            // Handle search button press.
+            // Handle route/search button press.
             TouchAction::Search if self.search_button.contains(removed.point) => {
-                self.event_loop.insert_idle(move |state| state.window.set_view(View::Search));
+                let view = if self.route.is_some() { View::Route } else { View::Search };
+                self.event_loop.insert_idle(move |state| state.window.set_view(view));
             },
             // Handle GPS centering button press.
             TouchAction::Gps if self.gps_button.contains(removed.point) => {
@@ -1390,17 +1386,17 @@ fn nearest_point(start: GeoPoint, end: GeoPoint, point: GeoPoint) -> GeoPoint {
 
 /// Navigation instruction details.
 #[derive(Debug)]
-pub struct Instruction<'a> {
-    pub text: Cow<'a, str>,
+pub struct Instruction {
+    pub text: Arc<String>,
     /// Segment time in seconds.
     pub time: u64,
     /// Segment length in meters.
     pub length: u32,
 }
 
-impl Instruction<'static> {
-    fn new(text: String, time: u64, length: u32) -> Self {
-        Self { text: Cow::Owned(text), time, length }
+impl Instruction {
+    fn new(text: Arc<String>, time: u64, length: u32) -> Self {
+        Self { text, time, length }
     }
 }
 
@@ -1412,27 +1408,29 @@ mod route {
     #[derive(Default)]
     pub struct MapRoute {
         points: Vec<RenderGeoPoint>,
-        instructions: Vec<(usize, Instruction<'static>)>,
+        instructions: Vec<(usize, Instruction)>,
         has_gps_origin: bool,
+        mode: RouteMode,
         offset: usize,
     }
 
     impl MapRoute {
         /// Update this route.
-        pub fn set_route(&mut self, route: Route, is_gps_route: bool) {
+        pub fn set_route(&mut self, route: Arc<Route>, is_gps_route: bool) {
             self.has_gps_origin = is_gps_route;
+            self.mode = route.mode;
             self.instructions.clear();
             self.points.clear();
 
             // Convert route from segments to renderable geographic points.
-            for segment in route.segments.into_iter() {
+            for segment in route.segments.iter() {
                 // Add instruction with its starting point index.
                 let instruction =
-                    Instruction::new(segment.instruction, segment.time, segment.length);
+                    Instruction::new(segment.instruction.clone(), segment.time, segment.length);
                 self.instructions.push((self.points.len(), instruction));
 
                 // Add all points for this segment.
-                self.points.extend(segment.points.into_iter().map(RenderGeoPoint::from));
+                self.points.extend(segment.points.iter().map(|point| RenderGeoPoint::from(*point)));
             }
         }
 
@@ -1447,8 +1445,8 @@ mod route {
         }
 
         /// Get the current route segment's instruction.
-        pub fn instruction(&self) -> Instruction<'_> {
-            let mut text = Cow::Borrowed("Error: No Instruction Found");
+        pub fn instruction(&self) -> Instruction {
+            let mut text = None;
             let mut start_index = 0;
             let mut length = 0;
             let mut time = 0;
@@ -1456,7 +1454,7 @@ mod route {
             for (i, instruction) in &self.instructions {
                 if *i <= self.offset {
                     // Ensure instruction text is set if there is no next segment.
-                    text = Cow::Borrowed(&instruction.text);
+                    text = Some(instruction.text.clone());
 
                     // Use time and length from the current segment.
                     length = instruction.length;
@@ -1464,7 +1462,7 @@ mod route {
                     start_index = *i;
                 } else {
                     // Use instruction text from the next segment if available.
-                    text = Cow::Borrowed(&instruction.text);
+                    text = Some(instruction.text.clone());
 
                     // Approximate travelled distance/time by assuming every node is evenly spaced.
                     let total_nodes = i - start_index;
@@ -1476,6 +1474,9 @@ mod route {
                     break;
                 }
             }
+
+            // Provide fallback error text, which should never happen.
+            let text = text.unwrap_or_else(|| Arc::new("Error: No Instruction Found".into()));
 
             Instruction { text, length, time }
         }
@@ -1498,6 +1499,11 @@ mod route {
         /// Get mutable access to all points in the route.
         pub fn points_mut(&mut self) -> &mut [RenderGeoPoint] {
             &mut self.points[self.offset..]
+        }
+
+        /// Get the route's transportation mode.
+        pub fn mode(&mut self) -> RouteMode {
+            self.mode
         }
 
         /// Get points remaining in this route.
