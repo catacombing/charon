@@ -569,8 +569,14 @@ impl MapView {
                 let (index, distance) = nearest_route_segment(route.points(), point.point);
 
                 // Update the route to remove segments already traveled.
-                if distance <= MAX_GPS_ROUTE_DISTANCE {
+                if distance <= MAX_GPS_ROUTE_DISTANCE && index > 0 {
                     route.truncate_start(index);
+
+                    // Update progress in the route view.
+                    let progress = route.progress();
+                    self.event_loop.insert_idle(move |state| {
+                        state.window.views.route().set_progress(progress);
+                    });
                 }
 
                 // Reroute if GPS is way off course.
@@ -1464,7 +1470,7 @@ mod route {
                     // Use instruction text from the next segment if available.
                     text = Some(instruction.text.clone());
 
-                    // Approximate travelled distance/time by assuming every node is evenly spaced.
+                    // Approximate traveled distance/time by assuming every node is evenly spaced.
                     let total_nodes = i - start_index;
                     let completed_nodes = self.offset - start_index;
                     let remaining = 1. - completed_nodes as f64 / total_nodes as f64;
@@ -1479,6 +1485,13 @@ mod route {
             let text = text.unwrap_or_else(|| Arc::new("Error: No Instruction Found".into()));
 
             Instruction { text, length, time }
+        }
+
+        /// Get the current progress in the route.
+        ///
+        /// Progress is defined as the number of traveled nodes.
+        pub fn progress(&self) -> usize {
+            self.offset
         }
 
         /// Get the start of the route.

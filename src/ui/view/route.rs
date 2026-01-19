@@ -40,11 +40,14 @@ pub struct RouteView {
     route: Arc<Route>,
     segments: Vec<RenderSegment>,
     is_gps_route: bool,
+    scroll_to_progress: bool,
+    progress: usize,
 
     cancel_button: Button,
     back_button: Button,
     mode_button: Button,
     alt_bg_paint: Paint,
+    hl_paint: Paint,
 
     touch_state: TouchState,
     input_config: Input,
@@ -81,19 +84,25 @@ impl RouteView {
         let mut alt_bg_paint = Paint::default();
         alt_bg_paint.set_color4f(Color4f::from(config.colors.alt_background), None);
 
+        let mut hl_paint = Paint::default();
+        hl_paint.set_color4f(Color4f::from(config.colors.highlight), None);
+
         Ok(Self {
-            alt_bg_paint,
             cancel_button,
+            alt_bg_paint,
             back_button,
             mode_button,
             event_loop,
+            hl_paint,
             size,
             input_config: config.input,
             dirty: true,
             scale: 1.,
+            scroll_to_progress: Default::default(),
             scroll_offset: Default::default(),
             is_gps_route: Default::default(),
             touch_state: Default::default(),
+            progress: Default::default(),
             segments: Default::default(),
             route: Default::default(),
         })
@@ -108,7 +117,14 @@ impl RouteView {
 
         self.scroll_offset = 0.;
         self.segments.clear();
+        self.progress = 0;
         self.dirty = true;
+    }
+
+    /// Set the number of nodes already traveled in the route.
+    pub fn set_progress(&mut self, progress: usize) {
+        self.dirty |= self.progress != progress;
+        self.progress = progress;
     }
 
     /// Physical size of the UI SVG buttons.
@@ -208,20 +224,9 @@ impl UiView for RouteView {
             self.scroll_offset += delta.y;
         }
 
-        // Ensure offset is correct in case size changed.
-        //
-        // This uses the last draw's scroll offset, but since the segments never change
-        // and the initial draw has no offset, this is not an issue.
-        self.clamp_scroll_offset();
-
-        // Clear dirtiness flag.
-        //
-        // This is inentionally placed after functions like `clamp_scroll_offset`, since
-        // these modify dirtiness but do not require another redraw.
-        self.dirty = false;
-
         // Ensure paints are up to date.
         self.alt_bg_paint.set_color4f(Color4f::from(config.colors.alt_background), None);
+        self.hl_paint.set_color4f(Color4f::from(config.colors.highlight), None);
 
         render_state.clear(config.colors.background);
 
@@ -232,9 +237,6 @@ impl UiView for RouteView {
         let segment_padding = (SEGMENT_Y_PADDING * self.scale).round() as i32;
         let segment_start = Point::new(outside_padding, back_button_point.y - outside_padding);
         let segment_width = size.width as f32 - 2. * outside_padding as f32;
-
-        let mut segment_point = segment_start;
-        segment_point.y += self.scroll_offset.round() as i32;
 
         // Set clipping mask to cut off segments overlapping the bottom button.
         let clip_rect = Rect::new(0., 0., size.width as f32, segment_start.y as f32);
@@ -258,8 +260,38 @@ impl UiView for RouteView {
             }
         }
 
+        // While progress tracking is active, scroll to the currently active segment.
+        let mut segment_progress = 0;
+        if self.scroll_to_progress {
+            // Get combined height of all segments before the active one.
+            let mut min_scroll_offset = 0.;
+            for segment in &self.segments {
+                segment_progress += segment.node_count;
+                if segment_progress > self.progress {
+                    break;
+                }
+
+                min_scroll_offset += segment.height + segment_padding as f32;
+            }
+
+            // Scroll to the active segment.
+            self.scroll_offset = self.scroll_offset.max(min_scroll_offset as f64);
+        }
+
+        // Clamp scroll offset after scrolling to the active segment, since this might
+        // have scrolled beyond the top of the viewport.
+        self.clamp_scroll_offset();
+
+        let mut segment_point = segment_start;
+        segment_point.y += self.scroll_offset.round() as i32;
+
         // Render route segments.
+        segment_progress = 0;
         for segment in &mut self.segments {
+            // Calculate progress from this segment, a negative progress is always `None`.
+            let relative_progress = self.progress.checked_sub(segment_progress);
+            segment_progress += segment.node_count;
+
             // Skip offscreen segments.
             let height = segment.height.round() as i32;
             if segment_point.y < 0 {
@@ -269,7 +301,13 @@ impl UiView for RouteView {
                 continue;
             }
 
-            segment.draw(&self.alt_bg_paint, &mut render_state, segment_point);
+            segment.draw(
+                &self.alt_bg_paint,
+                &self.hl_paint,
+                &mut render_state,
+                segment_point,
+                relative_progress,
+            );
 
             segment_point.y -= height + segment_padding;
         }
@@ -318,6 +356,12 @@ impl UiView for RouteView {
         self.cancel_button.draw(&mut render_state, config.colors.alt_background);
         self.mode_button.draw(&mut render_state, config.colors.alt_background);
         self.back_button.draw(&mut render_state, config.colors.alt_background);
+
+        // Clear dirtiness flag.
+        //
+        // This is placed at the end after functions like `clamp_scroll_offset`, since
+        // these modify dirtiness but do not require another redraw.
+        self.dirty = false;
     }
 
     fn dirty(&self) -> bool {
@@ -408,6 +452,9 @@ impl UiView for RouteView {
             self.scroll_offset += delta;
             self.clamp_scroll_offset();
             self.dirty |= self.scroll_offset != old_offset;
+
+            // Cancel automatic progress tracking on manual scroll.
+            self.scroll_to_progress = false;
         }
     }
 
@@ -464,6 +511,12 @@ impl UiView for RouteView {
             self.dirty = true;
         }
     }
+
+    fn enter(&mut self) {
+        // Follow current route progress by default.
+        self.scroll_to_progress = true;
+        self.scroll_offset = 0.;
+    }
 }
 
 /// Render objects for a route segment.
@@ -472,13 +525,14 @@ struct RenderSegment {
     instruction_height: f32,
 
     distance_paragraph: Option<Paragraph>,
+    length: u32,
 
     time_paragraph: Paragraph,
     time_height: f32,
 
-    length: u32,
-
     foreground: Color,
+    node_count: usize,
+
     inside_padding: f32,
     text_padding: f32,
     text_width: f32,
@@ -538,6 +592,7 @@ impl RenderSegment {
             text_width,
             height,
             width,
+            node_count: segment.points.len(),
             length: segment.length,
             distance_paragraph: Default::default(),
         }
@@ -545,7 +600,14 @@ impl RenderSegment {
 
     /// Layout a route segment for rendering.
     #[cfg_attr(feature = "profiling", profiling::function)]
-    fn draw<'a>(&mut self, alt_bg_paint: &Paint, render_state: &mut RenderState<'a>, point: Point) {
+    fn draw<'a>(
+        &mut self,
+        alt_bg_paint: &Paint,
+        hl_paint: &Paint,
+        render_state: &mut RenderState<'a>,
+        point: Point,
+        relative_progress: Option<usize>,
+    ) {
         // Layout segment distance.
         //
         // This is done during rendering because the time paragraph is sufficient to
@@ -561,11 +623,22 @@ impl RenderSegment {
         let mut distance_paragraph = builder.build();
         distance_paragraph.layout(self.text_width);
 
-        // Draw background.
+        // Calculate progress within this segment.
+        let progress = relative_progress.map_or(0., |p| p as f32 / self.node_count as f32).min(1.);
+
+        // Draw default background if progress doesn't cover the entire background.
         let bg_right = point.x as f32 + self.width;
         let bg_bottom = point.y as f32 - self.height;
-        let bg_rect = Rect::new(point.x as f32, point.y as f32, bg_right, bg_bottom);
-        render_state.draw_rect(bg_rect, alt_bg_paint);
+        let mut bg_rect = Rect::new(point.x as f32, point.y as f32, bg_right, bg_bottom);
+        if progress < 1. {
+            render_state.draw_rect(bg_rect, alt_bg_paint);
+        }
+
+        // Indicate segment progress percentage using highlight as background.
+        if progress > 0. {
+            bg_rect.right = point.x as f32 + self.width * progress;
+            render_state.draw_rect(bg_rect, hl_paint);
+        }
 
         // Draw all paragraphs.
 
