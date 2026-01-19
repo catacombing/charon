@@ -5,10 +5,10 @@ use std::mem;
 use std::sync::Arc;
 
 use calloop::LoopHandle;
-use skia_safe::textlayout::TextAlign;
+use skia_safe::textlayout::{Paragraph, TextAlign};
 use skia_safe::{Color4f, Paint, Rect};
 
-use crate::config::{Config, Input};
+use crate::config::{Color, Config, Input};
 use crate::geometry::{Point, Size};
 use crate::router::{Mode as RouteMode, Route, Segment};
 use crate::ui::skia::{RenderState, TextOptions};
@@ -38,7 +38,7 @@ const ALT_FONT_SIZE: f32 = 0.75;
 /// Route UI view.
 pub struct RouteView {
     route: Arc<Route>,
-    segment_heights: Vec<i32>,
+    segments: Vec<RenderSegment>,
     is_gps_route: bool,
 
     cancel_button: Button,
@@ -48,7 +48,6 @@ pub struct RouteView {
 
     touch_state: TouchState,
     input_config: Input,
-    max_scroll_offset: Option<f64>,
     scroll_offset: f64,
 
     event_loop: LoopHandle<'static, State>,
@@ -92,11 +91,10 @@ impl RouteView {
             input_config: config.input,
             dirty: true,
             scale: 1.,
-            max_scroll_offset: Default::default(),
-            segment_heights: Default::default(),
             scroll_offset: Default::default(),
             is_gps_route: Default::default(),
             touch_state: Default::default(),
+            segments: Default::default(),
             route: Default::default(),
         })
     }
@@ -108,85 +106,9 @@ impl RouteView {
         self.is_gps_route = is_gps_route;
         self.route = route;
 
-        self.max_scroll_offset = None;
-        self.segment_heights.clear();
         self.scroll_offset = 0.;
+        self.segments.clear();
         self.dirty = true;
-    }
-
-    /// Draw a route segment.
-    ///
-    /// This returns the height of the rendered segment.
-    #[cfg_attr(feature = "profiling", profiling::function)]
-    fn draw_segment<'a>(
-        &self,
-        config: &Config,
-        render_state: &mut RenderState<'a>,
-        point: Point,
-        width: f32,
-        segment: &Segment,
-    ) -> f32 {
-        let inside_padding = (SEGMENT_INSIDE_PADDING * self.scale).round() as f32;
-        let text_padding = (SEGMENT_TEXT_PADDING * self.scale).round() as f32;
-        let mut text_point =
-            Point::new(point.x as f32 + inside_padding, point.y as f32 - inside_padding);
-        let text_width = width - 2. * inside_padding;
-
-        // Layout instruction text.
-
-        let text_options = Some(TextOptions::new().ellipsize(false));
-        let mut builder = render_state.paragraph(config.colors.foreground, 1., text_options);
-        builder.add_text(&*segment.instruction);
-
-        let mut instruction_paragraph = builder.build();
-        instruction_paragraph.layout(text_width);
-        let instruction_height = instruction_paragraph.height();
-
-        // Layout segment duration.
-
-        let hours = segment.time / 3600;
-        let minutes = (segment.time % 3600 + 30) / 60;
-
-        let mut builder = render_state.paragraph(config.colors.foreground, ALT_FONT_SIZE, None);
-        builder.add_text(format!("{hours:0>2}:{minutes:0>2}"));
-
-        let mut time_paragraph = builder.build();
-        time_paragraph.layout(text_width);
-        let time_height = time_paragraph.height();
-
-        // Layout segment distance.
-
-        let mut distance = String::with_capacity("X.XX km".len());
-        view::format_distance(&mut distance, segment.length);
-
-        let text_options = Some(TextOptions::new().align(TextAlign::Right));
-        let mut builder =
-            render_state.paragraph(config.colors.foreground, ALT_FONT_SIZE, text_options);
-        builder.add_text(&distance);
-
-        let mut distance_paragraph = builder.build();
-        distance_paragraph.layout(text_width);
-
-        // Skip rendering if segment is fully offscreen.
-        let height = instruction_height + time_height + 2. * inside_padding + text_padding;
-        if point.y as f32 - height >= self.size.height as f32 * self.scale as f32 || point.y < 0 {
-            return height;
-        }
-
-        // Draw background.
-        let bg_right = point.x as f32 + width;
-        let bg_bottom = point.y as f32 - height;
-        let bg_rect = Rect::new(point.x as f32, point.y as f32, bg_right, bg_bottom);
-        render_state.draw_rect(bg_rect, &self.alt_bg_paint);
-
-        // Draw all paragraphs.
-        text_point.y -= time_height;
-        time_paragraph.paint(render_state, text_point);
-        distance_paragraph.paint(render_state, text_point);
-        text_point.y -= instruction_height + text_padding;
-        instruction_paragraph.paint(render_state, text_point);
-
-        height
     }
 
     /// Physical size of the UI SVG buttons.
@@ -248,7 +170,7 @@ impl RouteView {
     /// Clamp viewport offset.
     fn clamp_scroll_offset(&mut self) {
         let old_offset = self.scroll_offset;
-        let max_offset = self.max_scroll_offset.unwrap_or(0.);
+        let max_offset = self.max_scroll_offset() as f64;
         self.scroll_offset = self.scroll_offset.clamp(0., max_offset);
 
         // Cancel velocity after reaching the scroll limit.
@@ -256,6 +178,23 @@ impl RouteView {
             self.touch_state.velocity.stop();
             self.dirty = true;
         }
+    }
+
+    /// Get maximum viewport offset.
+    fn max_scroll_offset(&self) -> usize {
+        let outside_padding = (OUTSIDE_PADDING as f64 * self.scale).round() as usize;
+        let segment_padding = (SEGMENT_Y_PADDING * self.scale).round() as usize;
+
+        // Calculate height of all segments plus padding.
+        let segments_height: f32 = self.segments.iter().map(|segment| segment.height).sum();
+        let padding_count = self.segments.len().saturating_sub(1);
+        let total_height = segments_height.round() as usize
+            + padding_count * segment_padding
+            + 2 * outside_padding;
+
+        // Calculate content outside the viewport.
+        let back_button_point = Self::back_button_point(self.size, self.scale);
+        total_height.saturating_sub(back_button_point.y as usize)
     }
 }
 
@@ -290,7 +229,7 @@ impl UiView for RouteView {
 
         let back_button_point = Self::back_button_point(self.size, self.scale);
         let outside_padding = (OUTSIDE_PADDING as f64 * self.scale).round() as i32;
-        let padding = (SEGMENT_Y_PADDING * self.scale).round() as i32;
+        let segment_padding = (SEGMENT_Y_PADDING * self.scale).round() as i32;
         let segment_start = Point::new(outside_padding, back_button_point.y - outside_padding);
         let segment_width = size.width as f32 - 2. * outside_padding as f32;
 
@@ -302,36 +241,37 @@ impl UiView for RouteView {
         render_state.save();
         render_state.clip_rect(clip_rect, None, Some(false));
 
-        // Render route segments.
+        // Layout all route segments on the route's first draw.
         //
-        // Since segments are variable in height based on content, we layout every
-        // segment the first time a route is rendered. That information allows us to
-        // calculate the maximum scroll offset and skip offscreen segments.
-        for (i, segment) in self.route.segments.iter().enumerate() {
-            // Skip offscreen segments, if we've already calculated the max scroll offset.
-            if self.max_scroll_offset.is_some() {
-                if segment_point.y < 0 {
-                    break;
-                } else if segment_point.y - self.segment_heights[i] >= segment_start.y {
-                    segment_point.y -= self.segment_heights[i] + padding;
-                    continue;
-                }
-            }
-
-            let segment_height = self
-                .draw_segment(config, &mut render_state, segment_point, segment_width, segment)
-                .round() as i32;
-            segment_point.y -= segment_height + padding;
-
-            if self.max_scroll_offset.is_none() {
-                self.segment_heights.push(segment_height);
+        // We layout every segment ahead of time since segments can have varying
+        // heights, while all their combined heights are necessary to determine
+        // the maximum scroll offset.
+        if self.segments.is_empty() {
+            for segment in self.route.segments.iter() {
+                self.segments.push(RenderSegment::new(
+                    config,
+                    &mut render_state,
+                    segment_width,
+                    self.scale,
+                    segment,
+                ));
             }
         }
 
-        // Update maximum scroll offset based on rendered segments.
-        if self.max_scroll_offset.is_none() {
-            let max_offset = (-segment_point.y + outside_padding) as f64;
-            self.max_scroll_offset = Some(max_offset.max(0.));
+        // Render route segments.
+        for segment in &mut self.segments {
+            // Skip offscreen segments.
+            let height = segment.height.round() as i32;
+            if segment_point.y < 0 {
+                break;
+            } else if segment_point.y - height >= segment_start.y {
+                segment_point.y -= height + segment_padding;
+                continue;
+            }
+
+            segment.draw(&self.alt_bg_paint, &mut render_state, segment_point);
+
+            segment_point.y -= height + segment_padding;
         }
 
         // Reset route segment clipping mask.
@@ -523,6 +463,142 @@ impl UiView for RouteView {
             self.input_config = config.input;
             self.dirty = true;
         }
+    }
+}
+
+/// Render objects for a route segment.
+struct RenderSegment {
+    instruction_paragraph: Paragraph,
+    instruction_height: f32,
+
+    distance_paragraph: Option<Paragraph>,
+
+    time_paragraph: Paragraph,
+    time_height: f32,
+
+    length: u32,
+
+    foreground: Color,
+    inside_padding: f32,
+    text_padding: f32,
+    text_width: f32,
+    height: f32,
+    width: f32,
+}
+
+impl RenderSegment {
+    /// Layout a route segment for rendering.
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn new<'a>(
+        config: &Config,
+        render_state: &mut RenderState<'a>,
+        width: f32,
+        scale: f64,
+        segment: &Segment,
+    ) -> Self {
+        let foreground = config.colors.foreground;
+
+        let text_padding = (SEGMENT_TEXT_PADDING * scale).round() as f32;
+        let inside_padding = (SEGMENT_INSIDE_PADDING * scale).round() as f32;
+        let text_width = width - 2. * inside_padding;
+
+        // Layout instruction text.
+
+        let text_options = Some(TextOptions::new().ellipsize(false));
+        let mut builder = render_state.paragraph(foreground, 1., text_options);
+        builder.add_text(&*segment.instruction);
+
+        let mut instruction_paragraph = builder.build();
+        instruction_paragraph.layout(text_width);
+        let instruction_height = instruction_paragraph.height();
+
+        // Layout segment duration.
+
+        let hours = segment.time / 3600;
+        let minutes = (segment.time % 3600 + 30) / 60;
+
+        let mut builder = render_state.paragraph(foreground, ALT_FONT_SIZE, None);
+        builder.add_text(format!("{hours:0>2}:{minutes:0>2}"));
+
+        let mut time_paragraph = builder.build();
+        time_paragraph.layout(text_width);
+        let time_height = time_paragraph.height();
+
+        // Calculate segment's render height.
+        let height = instruction_height + time_height + 2. * inside_padding + text_padding;
+
+        Self {
+            instruction_paragraph,
+            instruction_height,
+            inside_padding,
+            time_paragraph,
+            text_padding,
+            time_height,
+            foreground,
+            text_width,
+            height,
+            width,
+            length: segment.length,
+            distance_paragraph: Default::default(),
+        }
+    }
+
+    /// Layout a route segment for rendering.
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn draw<'a>(&mut self, alt_bg_paint: &Paint, render_state: &mut RenderState<'a>, point: Point) {
+        // Layout segment distance.
+        //
+        // This is done during rendering because the time paragraph is sufficient to
+        // determine a segment's height, since it matches the distance height.
+
+        let mut distance = String::with_capacity("X.XX km".len());
+        view::format_distance(&mut distance, self.length);
+
+        let text_options = Some(TextOptions::new().align(TextAlign::Right));
+        let mut builder = render_state.paragraph(self.foreground, ALT_FONT_SIZE, text_options);
+        builder.add_text(&distance);
+
+        let mut distance_paragraph = builder.build();
+        distance_paragraph.layout(self.text_width);
+
+        // Draw background.
+        let bg_right = point.x as f32 + self.width;
+        let bg_bottom = point.y as f32 - self.height;
+        let bg_rect = Rect::new(point.x as f32, point.y as f32, bg_right, bg_bottom);
+        render_state.draw_rect(bg_rect, alt_bg_paint);
+
+        // Draw all paragraphs.
+
+        let mut text_point =
+            Point::new(point.x as f32 + self.inside_padding, point.y as f32 - self.inside_padding);
+
+        text_point.y -= self.time_height;
+        self.time_paragraph.paint(render_state, text_point);
+        self.distance_paragraph(render_state).paint(render_state, text_point);
+        text_point.y -= self.instruction_height + self.text_padding;
+        self.instruction_paragraph.paint(render_state, text_point);
+    }
+
+    /// Get distance text paragraph.
+    ///
+    /// The distance paragraph is dynamically layouted on demand, since it is
+    /// not required to determine the height of the segment, while it still
+    /// benefits from being cached, if it has been drawn before.
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    fn distance_paragraph<'a>(&mut self, render_state: &mut RenderState<'a>) -> &Paragraph {
+        self.distance_paragraph.get_or_insert_with(|| {
+            let mut distance = String::with_capacity("X.XX km".len());
+            view::format_distance(&mut distance, self.length);
+
+            let text_options = Some(TextOptions::new().align(TextAlign::Right));
+            let mut builder = render_state.paragraph(self.foreground, ALT_FONT_SIZE, text_options);
+            builder.add_text(&distance);
+
+            let mut distance_paragraph = builder.build();
+            distance_paragraph.layout(self.text_width);
+
+            distance_paragraph
+        })
     }
 }
 
