@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Default zoom on GPS location changed from level 19 to 18
 - Search for the route target will now use the origin as reference point
+- Increased input size for route buttons in search results
 
 ### Fixed
 

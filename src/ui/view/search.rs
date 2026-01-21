@@ -20,7 +20,7 @@ use crate::region::Regions;
 use crate::router::{Mode as RouteMode, Router, RoutingQuery};
 use crate::ui::skia::{RenderState, TextOptions};
 use crate::ui::view::{self, UiView, View};
-use crate::ui::{Button, Svg, TextField, Velocity, rect_contains};
+use crate::ui::{Button, Svg, TextField, Velocity};
 use crate::{Error, State};
 
 /// Padding around the screen edge at scale 1.
@@ -533,13 +533,13 @@ impl SearchView {
         let result = self.results().get(index)?;
 
         // Check whether the tap is within the result's button.
-        let relative_x = point.x - result_point.x as f64;
-        let relative_y = results_height - 1. - (bottom_relative % results_height);
-        let relative_point = Point::new(relative_x, relative_y);
+        //
+        // Anything inside the result beyond the start of the button padding is
+        // considered part of the routing button, since it can be difficult to
+        // hit consistently otherwise.
+        let padding = (RESULTS_INSIDE_PADDING * self.scale).round();
         let routing_button_point: Point<f64> = self.routing_button_point().into();
-        let routing_button_size: Size<f64> = self.routing_button_size().into();
-        let button_pressed =
-            rect_contains(routing_button_point, routing_button_size, relative_point);
+        let button_pressed = point.x - result_point.x as f64 >= routing_button_point.x - padding;
 
         Some((result, button_pressed))
     }
