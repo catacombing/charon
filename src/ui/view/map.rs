@@ -315,6 +315,7 @@ impl MapView {
             profiling::scope!("draw_route_segments");
 
             let mut path = PathBuilder::new();
+            path.set_is_volatile(true);
             let route_len = route.len();
             let mut last_node = None;
             let mut skipped = true;

@@ -295,6 +295,7 @@ dependencies = [
  "glutin",
  "indexmap",
  "profiling",
+ "prost",
  "puffin_http",
  "raw-window-handle",
  "reqwest",

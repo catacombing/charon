@@ -59,6 +59,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 valhalla = "0.6.25"
 wayland-backend = { version = "0.3.11", features = ["client_system"] }
 zbus = { version = "5.12.0", default-features = false, features =  ["tokio"] }
+prost = "0.14.3"
 
 [build-dependencies]
 gl_generator = "0.14.0"

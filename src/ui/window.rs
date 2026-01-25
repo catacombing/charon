@@ -6,6 +6,7 @@ use std::ptr::NonNull;
 use _text_input::zwp_text_input_v3::{ChangeCause, ContentHint, ContentPurpose, ZwpTextInputV3};
 use calloop::LoopHandle;
 use glutin::display::{Display, DisplayApiPreference};
+use prost::Message;
 use raw_window_handle::{RawDisplayHandle, WaylandDisplayHandle};
 use smithay_client_toolkit::compositor::{CompositorState, Region};
 use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
@@ -15,8 +16,10 @@ use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::xdg::window::{Window as XdgWindow, WindowDecorations};
 
-use crate::config::Config;
+use crate::config::{Color, Config};
 use crate::geometry::{Point, Size};
+use crate::tiles::vector::protobuf::Tile;
+use crate::tiles::vector::{SkiaRenderer, Theme};
 use crate::ui::renderer::Renderer;
 use crate::ui::skia::Canvas;
 use crate::ui::view::{View, Views};
@@ -47,6 +50,8 @@ pub struct Window {
     text_input_dirty: bool,
     stalled: bool,
     dirty: bool,
+
+    mvt_skia: SkiaRenderer,
 }
 
 impl Window {
@@ -89,7 +94,29 @@ impl Window {
         let views = Views::new(event_loop, &config, size)?;
         let canvas = Canvas::new(&config);
 
+        // TODO: Testing.
+        let theme = Theme {
+            land: Color::new(242, 239, 233),
+            water: Color::new(170, 211, 223),
+            border: Color::new(191, 169, 186),
+            street: Color::new(255, 255, 255),
+            street_highway: Color::new(233, 144, 160),
+            street_primary: Color::new(253, 215, 161),
+            street_secondary: Color::new(246, 250, 187),
+            street_footway: Color::new(250, 128, 114),
+            street_plaza: Color::new(221, 221, 232),
+            street_rail: Color::new(112, 112, 112),
+            nature_forest: Color::new(173, 209, 158),
+            nature_grass: Color::new(205, 235, 176),
+            nature_scrub: Color::new(200, 215, 171),
+            nature_park: Color::new(200, 250, 204),
+            building: Color::new(217, 208, 201),
+            text: Color::new(0, 0, 0),
+        };
+        let mvt_skia = SkiaRenderer::new(theme);
+
         Ok(Self {
+            mvt_skia,
             connection,
             xdg_window,
             renderer,
@@ -136,13 +163,26 @@ impl Window {
         let wl_surface = self.xdg_window.wl_surface();
         wl_surface.damage(0, 0, self.size.width as i32, self.size.height as i32);
 
+        let start = std::time::Instant::now();
+        const MVT: &[u8] = include_bytes!("/home/undeadleech/vector_tile_tests/14_8508_5489.mvt");
+        let tile = Tile::decode(MVT).unwrap();
+        println!("DECODE: {:?}", start.elapsed());
+
+        // TODO
+        //
         // Render the window content.
+        let start = std::time::Instant::now();
         let size = self.size * self.scale;
         self.renderer.draw(size, |renderer| {
             self.canvas.draw(renderer.skia_config(), size, |render_state| {
-                self.views.draw(&self.config, render_state);
+                // self.views.draw(&self.config, render_state);
+
+                render_state.clear(self.mvt_skia.theme.land);
+                let size = Size::new(size.width, size.width);
+                self.mvt_skia.render(&render_state, Point::new(0., 0.), size.into(), tile);
             });
         });
+        println!("RENDER: {:?}", start.elapsed());
 
         // Request a new frame.
         wl_surface.frame(&self.queue, wl_surface.clone());

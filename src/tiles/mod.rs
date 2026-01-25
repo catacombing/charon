@@ -21,6 +21,8 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::geometry::{Point, Size};
 
+pub mod vector;
+
 /// Width and height of a single tile.
 pub const TILE_SIZE: i32 = 256;
 
