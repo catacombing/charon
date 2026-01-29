@@ -73,12 +73,14 @@ impl Tiles {
     /// Get a raster map tile.
     #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn get(&mut self, index: TileIndex) -> &mut Tile {
-        if !self.lru_cache.has_tile(&index) {
-            let download_state = self.download_state.clone();
-            self.lru_cache.insert(Tile::new(download_state, index));
-        }
+        self.preload(index);
+        self.try_get(index).unwrap()
+    }
 
-        self.lru_cache.get(&index).unwrap()
+    /// Get a raster tile from the cache, without loading it if missing.
+    #[cfg_attr(feature = "profiling", profiling::function)]
+    pub fn try_get(&mut self, index: TileIndex) -> Option<&mut Tile> {
+        self.lru_cache.get(&index)
     }
 
     /// Ensure a map tile is downloaded.

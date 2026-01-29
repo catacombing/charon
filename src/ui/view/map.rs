@@ -1,6 +1,6 @@
 //! Map rendering UI view.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +11,8 @@ use calloop::{LoopHandle, RegistrationToken};
 use reqwest::Client;
 use skia_safe::textlayout::TextAlign;
 use skia_safe::{
-    Color4f, FilterMode, MipmapMode, Paint, PaintCap, PaintJoin, PathBuilder, Rect, SamplingOptions,
+    ClipOp, Color4f, FilterMode, MipmapMode, Paint, PaintCap, PaintJoin, PathBuilder, Rect,
+    SamplingOptions,
 };
 use tracing::error;
 
@@ -90,6 +91,7 @@ const GPS_ZOOM: u8 = 18;
 
 /// Map rendering UI view.
 pub struct MapView {
+    rendered_parent_tiles: HashSet<TileIndex>,
     pending_tiles: Vec<TileIndex>,
     tiles: Tiles,
 
@@ -184,6 +186,7 @@ impl MapView {
             input_config: config.input,
             dirty: true,
             scale: 1.,
+            rendered_parent_tiles: Default::default(),
             pending_tiles: Default::default(),
             cursor_zoom: Default::default(),
             touch_state: Default::default(),
@@ -198,26 +201,86 @@ impl MapView {
     /// Render all visible tiles.
     #[cfg_attr(feature = "profiling", profiling::function)]
     fn draw_tiles<'a>(&mut self, render_state: &mut RenderState<'a>, iter: &mut TileIter) {
+        let size: Size<f32> = (self.size * self.scale).into();
         let tile_size = iter.tile_size() as f32;
 
+        // Reset which oversized tiles have been rendered this run.
+        self.rendered_parent_tiles.clear();
+
         for (index, point) in iter {
+            let mut point: Point<f32> = point.into();
+            let mut tile_size = tile_size;
+
             // Get image for this tile.
-            let image = match self.tiles.get(index).image() {
-                Some(image) => image,
-                // If the image hasn't loaded yet, add it to the pending tiles.
+            let (image, fallback) = match self.tiles.get(index).image() {
+                Some(image) => (image, false),
                 None => {
+                    #[cfg(feature = "profiling")]
+                    profiling::scope!("tile_fallback");
+
+                    // If the image hasn't loaded yet, add it to the pending tiles.
                     self.pending_tiles.push(index);
-                    continue;
+
+                    // Search for a bigger tile which is already loaded.
+                    let mut alt_index = index;
+                    let mut alt_image = None;
+                    while alt_index.z > 0 && alt_image.is_none() {
+                        // Get the next bigger tile index.
+                        alt_index.x /= 2;
+                        alt_index.y /= 2;
+                        alt_index.z -= 1;
+
+                        if self.rendered_parent_tiles.contains(&alt_index) {
+                            // Skip drawing if the fallback parent was already rendered.
+                            break;
+                        } else {
+                            // Try to load this parent's image from the cache.
+                            alt_image = self.tiles.try_get(alt_index).and_then(|tile| tile.image());
+                        }
+                    }
+
+                    match (alt_index, alt_image) {
+                        // Use scaled up parent tile as placeholder.
+                        (alt_index, Some(alt_image)) => {
+                            // Mark tile as rendered, so we can skip rendering if another
+                            // subtile of this tile is also missing.
+                            self.rendered_parent_tiles.insert(alt_index);
+
+                            // Setup clipping to ensure previous tiles stay unharmed.
+
+                            render_state.save();
+
+                            // Exclude everything above this tile.
+                            let below_rect = Rect::new(0., point.y, size.width, size.height);
+                            render_state.clip_rect(below_rect, None, Some(false));
+
+                            // Exclude everything to the left of this tile.
+                            let left_rect = Rect::new(0., point.y, point.x, point.y + tile_size);
+                            render_state.clip_rect(left_rect, ClipOp::Difference, Some(false));
+
+                            // Transform tile scale and position.
+
+                            // Scale tile to match the desired zoom level.
+                            let pow = 2f32.powi((index.z - alt_index.z) as i32);
+                            tile_size *= pow;
+
+                            // Update tile render origin.
+                            point.x -= tile_size * (index.x as f32 / pow).fract();
+                            point.y -= tile_size * (index.y as f32 / pow).fract();
+
+                            (alt_image, true)
+                        },
+                        // Skip tile if neither it nor any parent can be rendered immediately.
+                        (_, None) => continue,
+                    }
                 },
             };
 
             #[cfg(feature = "profiling")]
             profiling::scope!("draw_tile_image");
 
-            // Calculate tile's destination rectangle.
-            let (x, y) = (point.x as f32, point.y as f32);
-            let dst_rect = Rect::new(x, y, x + tile_size, y + tile_size);
-
+            // Draw the scaled tile to the canvas.
+            let dst_rect = Rect::new(point.x, point.y, point.x + tile_size, point.y + tile_size);
             let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::Linear);
             render_state.draw_image_rect_with_sampling_options(
                 image,
@@ -226,6 +289,11 @@ impl MapView {
                 sampling,
                 &self.tile_paint,
             );
+
+            // Reset clipping mask after rendering a bigger tile.
+            if fallback {
+                render_state.restore();
+            }
         }
     }
 

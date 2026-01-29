@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+### Added
+
+- Scaled parent tiles are now used as placeholder when tiles cannot be loaded
+
 ### Fixed
 
 - Not starting with missing cache directory
