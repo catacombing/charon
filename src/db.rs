@@ -23,6 +23,10 @@ impl Db {
         let tiles_path =
             dirs::cache_dir().ok_or(Error::MissingCacheDir)?.join("charon/tiles.sqlite");
 
+        // Ensure Charon's cache directory exists.
+        let db_dir = db_path.parent().ok_or(Error::MissingCacheDir)?;
+        fs::create_dir_all(db_dir)?;
+
         // Migrate tile storage DB to a more generic name.
         if tiles_path.exists() && !db_path.exists() {
             fs::rename(&tiles_path, &db_path)?;
