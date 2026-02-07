@@ -1,12 +1,15 @@
 //! Geographic region management.
 
-use std::fs;
-use std::fs::File;
-use std::io::{self, Read, Write};
+use std::borrow::Cow;
+use std::fs::File as StdFile;
+use std::io::Write;
+use std::marker::Unpin;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
+use async_compression::tokio::bufread::GzipDecoder;
 use bzip2::write::BzDecoder;
 use calloop::LoopHandle;
 use calloop::ping::{self, Ping};
@@ -14,13 +17,19 @@ use indexmap::IndexMap;
 use reqwest::Client;
 use reqwest::header::CONTENT_LENGTH;
 use serde::Deserialize;
+use smallvec::SmallVec;
 use sqlx::QueryBuilder;
-use tar::{Archive, Entry};
 use tempfile::NamedTempFile;
+use tokio::fs;
+use tokio::fs::File;
+use tokio::io::{self, AsyncRead, AsyncReadExt, BufReader};
 use tokio::task::JoinSet;
+use tokio_stream::StreamExt;
+use tokio_tar::{Archive, Entry};
 use tracing::{debug, error, warn};
 
 use crate::db::Db;
+use crate::tiles::TileIndex;
 use crate::{Error, State};
 
 /// Pre-parsed region data.
@@ -193,6 +202,27 @@ impl Regions {
             }
         }
 
+        // Import offline raster map tiles.
+        //
+        // This is done recursively for all tiles, since tiles are only stored at the
+        // bottommost region level.
+        let mut offline_tiles = SmallVec::new();
+        region.offline_tiles(&mut offline_tiles);
+        for (region, url) in offline_tiles {
+            // Add progress tracking for tile decompression/DB inserts.
+            tracker.add_download(region.tiles_size);
+
+            let client = self.client.clone();
+            let tracker = tracker.clone();
+            let region_id = region.id;
+            let url = url.to_string();
+            let db = self.db.clone();
+
+            downloads.spawn(async move {
+                Self::download_map_tiles(client, tracker, db, region_id, &url).await
+            });
+        }
+
         // Wait for all downloads to complete.
         //
         // Since we're nuking all existing data on any failure anyway, there's no reason
@@ -215,7 +245,7 @@ impl Regions {
         // Delete geocoder data.
         if let Some((_, region_name)) = region.geocoder_uri_path() {
             let path = self.geocoder_cache_dir.join(region_name);
-            if let Err(err) = fs::remove_dir_all(&path) {
+            if let Err(err) = fs::remove_dir_all(&path).await {
                 error!("Failed to delete {path:?}: {err}");
             }
         }
@@ -236,7 +266,7 @@ impl Regions {
 
             // Delete individual files, keeping the directories.
             for path in package_paths {
-                if let Err(err) = fs::remove_file(&path) {
+                if let Err(err) = fs::remove_file(&path).await {
                     error!("Failed to delete {path:?}: {err}");
                 }
             }
@@ -249,12 +279,24 @@ impl Regions {
                 .inspect_err(|err| error!("Failed to remove Valhalla package from DB: {err}"));
         }
 
+        // Delete offline map tiles for regions which aren't separately installed.
+        let mut offline_tiles = SmallVec::new();
+        region.offline_tiles(&mut offline_tiles);
+        for (region, _) in offline_tiles {
+            if !region.is_installed() {
+                let region_id = region.id;
+                if let Err(err) = self.db.delete_offline_tiles(region_id).await {
+                    error!("Failed to delete offline raster tiles for region {region_id}: {err}");
+                }
+            }
+        }
+
         // Delete postal country files, if they're not required by another region.
         if let Some((postal_path, country_code)) = region.postal_uri_path()
             && !self.world().requires_postal_country(postal_path, &region.name)
         {
             let path = Region::postal_country_fs_root(&self.postal_cache_dir, country_code);
-            if let Err(err) = fs::remove_dir_all(&path) {
+            if let Err(err) = fs::remove_dir_all(&path).await {
                 error!("Failed to delete {path:?}: {err}");
             }
         }
@@ -331,7 +373,7 @@ impl Regions {
         client: Client,
         tracker: &DownloadTracker,
         url: &str,
-        file: &mut File,
+        file: &mut StdFile,
     ) -> Result<(), Error> {
         // Create a streaming decoder into the file.
         let mut decoder = BzDecoder::new(file);
@@ -339,6 +381,7 @@ impl Regions {
         // Send download request.
         let mut response = client.get(url).send().await?.error_for_status()?;
 
+        // Add download size to progress tracker.
         let content_length = response
             .headers()
             .get(CONTENT_LENGTH)
@@ -357,6 +400,75 @@ impl Regions {
         Ok(())
     }
 
+    /// Download offline map tiles to the DB.
+    async fn download_map_tiles(
+        client: Client,
+        tracker: DownloadTracker,
+        db: Db,
+        region_id: u32,
+        url: &str,
+    ) -> Result<(), Error> {
+        // NOTE: We stream to a file here which is technically pointless and will just
+        // slow us down, but unfortunately Rust does not have a mature tar library that
+        // can handle streaming.
+        //
+        // See: https://github.com/alexcrichton/tar-rs/issues/427
+
+        let mut response = client.get(url).send().await?.error_for_status()?;
+
+        // Add download size to progress tracker.
+        let content_length = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|h| h.to_str().ok()?.parse().ok())
+            .unwrap_or(0);
+        tracker.add_download(content_length);
+
+        let mut tempfile = NamedTempFile::new()?;
+
+        // Stream data to file in chunks.
+        while let Some(chunk) = response.chunk().await? {
+            tracker.add_progress(chunk.len() as u64);
+            tempfile.as_file_mut().write_all(&chunk)?;
+        }
+
+        // XXX: This must reopen file, to reset read cursor position.
+        let mut file = File::open(tempfile.path()).await?;
+
+        // Write tile data in batches to improve performance.
+        const MAX_BATCH_SIZE: usize = 1_000;
+        let mut batch: Vec<(TileIndex, Vec<u8>)> = Vec::new();
+
+        // Write the archive one file at a time into the database.
+        let mut reader = BufReader::new(&mut file);
+        let mut decoder = GzipDecoder::new(&mut reader);
+        let mut tar = Archive::new(&mut decoder);
+        let mut entries = tar.entries()?;
+        while let Some(entry) = entries.next().await {
+            let mut entry = entry?;
+
+            // Write batch to the database.
+            if batch.len() >= MAX_BATCH_SIZE {
+                db.insert_offline_tiles(region_id, &batch).await?;
+                batch.clear();
+            }
+
+            // Stage this tile for writing.
+            let tile_index = parse_tar_file_name(entry.path()?).ok_or(Error::InvalidTileArchive)?;
+            let mut tile_data = Vec::new();
+            entry.read_to_end(&mut tile_data).await?;
+            tracker.add_progress(tile_data.len() as u64);
+            batch.push((tile_index, tile_data));
+        }
+
+        // Write all remaining tiles.
+        if !batch.is_empty() {
+            db.insert_offline_tiles(region_id, &batch).await?;
+        }
+
+        Ok(())
+    }
+
     /// Extract a valhalla tar archive.
     async fn extract_valhalla_tiles(
         db: Db,
@@ -370,26 +482,17 @@ impl Regions {
         let mut tempfile = NamedTempFile::new()?;
         Self::download_bz2(client, &tracker, url, tempfile.as_file_mut()).await?;
 
-        // Use archive size to show unpacking progress.
-        let size = tempfile.as_file().metadata().map_or(0, |m| m.len());
-        let mut progress = 0;
-        tracker.add_download(size);
-
         // Reopen tempfile to create archive reader from the start.
-        let mut archive_file = File::open(tempfile.path())?;
+        let mut archive_file = File::open(tempfile.path()).await?;
         let mut archive = Archive::new(&mut archive_file);
 
         let mut paths = Vec::new();
-        for entry in archive.entries_with_seek()? {
+        let mut entries = archive.entries()?;
+        while let Some(entry) = entries.next().await {
             let entry = entry?;
 
-            // Add progress made since last entry.
-            let new_progress = entry.raw_file_position().saturating_sub(progress);
-            tracker.add_progress(new_progress);
-            progress = new_progress;
-
             // Copy the file from the archive to its target location.
-            if let Some(path) = Self::extract_valhalla_tile(valhalla_cache_dir, entry)? {
+            if let Some(path) = Self::extract_valhalla_tile(valhalla_cache_dir, entry).await? {
                 let path_str = path.to_str().ok_or(Error::NonUtf8Path)?;
                 paths.push(path_str.to_string());
             }
@@ -402,21 +505,17 @@ impl Regions {
                 builder.push_bind(package);
                 builder.push_bind(path);
             });
-            builder.push(" ON CONFLICT DO NOTHING");
+            builder.push(" ON CONFLICT DO NOTHING ");
             builder.build().execute(db.pool().await).await?;
         }
-
-        // Finish up progress to account for the last entry.
-        tracker.add_progress(size.saturating_sub(progress));
 
         Ok(())
     }
 
     /// Extract a single Valhalla tile from a tar archive.
-    #[cfg_attr(feature = "profiling", profiling::function)]
-    fn extract_valhalla_tile<R: Read>(
+    async fn extract_valhalla_tile<R: AsyncRead + Unpin>(
         valhalla_cache_dir: &Path,
-        mut entry: Entry<'_, R>,
+        mut entry: Entry<R>,
     ) -> Result<Option<PathBuf>, Error> {
         // Ignore non-tile files.
         if !entry.path_bytes().ends_with(b".gph.gz") {
@@ -432,9 +531,11 @@ impl Regions {
         let parent = path.parent().ok_or(Error::UnexpectedRoot)?;
 
         // Write tile data to a temporary file.
-        fs::create_dir_all(parent)?;
-        let mut tempfile = NamedTempFile::new_in(parent)?;
-        io::copy(&mut entry, &mut tempfile)?;
+        fs::create_dir_all(parent).await?;
+        let tempfile = NamedTempFile::new_in(parent)?;
+        let mut async_tempfile = File::create(tempfile.path()).await?;
+        io::copy(&mut entry, &mut async_tempfile).await?;
+        drop(async_tempfile);
 
         // Atomically place tempfile into target location.
         tempfile.persist(&path)?;
@@ -471,6 +572,7 @@ impl RegionData {
 /// Data for a geographic region.
 #[derive(Deserialize, Debug)]
 pub struct Region {
+    pub id: u32,
     pub name: String,
     pub regions: IndexMap<String, Region>,
     // Complete size of this region and all of its children.
@@ -479,6 +581,8 @@ pub struct Region {
     valhalla_packages: Vec<String>,
     geocoder_path: Option<String>,
     postal_path: Option<String>,
+    tiles_url: Option<String>,
+    tiles_size: u64,
 
     #[serde(skip)]
     download_state: AtomicU8,
@@ -538,7 +642,7 @@ impl Region {
             || self.regions.values().any(Region::has_valhalla_tiles)
     }
 
-    /// Execute a function for all child regions.
+    /// Execute a function for all installed child regions.
     #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn for_installed(&self, f: &mut impl FnMut(&Self)) {
         if self.is_installed() {
@@ -573,6 +677,7 @@ impl Region {
         if self.geocoder_path.is_none()
             && self.valhalla_packages.is_empty()
             && self.postal_path.is_none()
+            && self.tiles_url.is_none()
         {
             self.set_download_state(DownloadState::NoData);
             return;
@@ -604,6 +709,33 @@ impl Region {
             if !postal_installed {
                 self.set_download_state(DownloadState::Available);
                 return;
+            }
+        }
+
+        // Check if there's at least one raster tile downloaded per region.
+        let mut offline_tiles = SmallVec::new();
+        self.offline_tiles(&mut offline_tiles);
+        for (region, _) in offline_tiles {
+            let region_id = region.id;
+
+            let result =
+                sqlx::query("SELECT region_id FROM offline_tile WHERE region_id = $1 LIMIT 1")
+                    .bind(region_id)
+                    .fetch_optional(db.pool().await)
+                    .await;
+
+            match result {
+                Ok(Some(_)) => (),
+                Ok(None) => {
+                    self.set_download_state(DownloadState::Available);
+                    return;
+                },
+                Err(err) => {
+                    error!("Failed to read offline tile data: {err}");
+
+                    self.set_download_state(DownloadState::Available);
+                    return;
+                },
             }
         }
 
@@ -711,6 +843,17 @@ impl Region {
         self.regions.values().any(|region| region.requires_valhalla_package(package, filter))
     }
 
+    /// Get ID and download URL for all child regions with offline tile data.
+    fn offline_tiles<'a>(&'a self, tiles: &mut SmallVec<[(&'a Self, &'a str); 100]>) {
+        if let Some(tiles_url) = &self.tiles_url {
+            tiles.push((self, tiles_url));
+        }
+
+        for region in self.regions.values() {
+            region.offline_tiles(tiles);
+        }
+    }
+
     /// Check whether this region's data is installed.
     ///
     /// This should be slightly faster than comparing `Self::download_state`
@@ -778,6 +921,27 @@ impl DownloadTracker {
     }
 }
 
+/// Parse the filename of a tile in an offlin map archive.
+///
+/// Example: `0_1_2.png` => TileIndex::new(1, 2, 0)
+fn parse_tar_file_name(path: Cow<'_, Path>) -> Option<TileIndex> {
+    let file_name = path.file_name()?.to_str()?;
+
+    // Strip extension.
+    let stripped = file_name.strip_suffix(".png")?;
+
+    // Extract coordinates.
+    let (z, rest) = stripped.split_once('_')?;
+    let (x, y) = rest.split_once('_')?;
+
+    // Parse text.
+    let x = u32::from_str(x).ok()?;
+    let y = u32::from_str(y).ok()?;
+    let z = u8::from_str(z).ok()?;
+
+    Some(TileIndex::new(x, y, z))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,18 +956,18 @@ mod tests {
         let world = RegionData::new().unwrap().world_region;
         assert_eq!(world.name, "World");
         assert_eq!(world.geocoder_path, None);
-        assert_eq!(world.storage_size, 111656154464);
+        assert_eq!(world.storage_size, 112753558200);
 
         let europe = world.regions.get("europe").unwrap();
         assert_eq!(europe.name, "Europe");
         assert_eq!(europe.geocoder_path, None);
-        assert_eq!(europe.storage_size, 40147973727);
+        assert_eq!(europe.storage_size, 41245377463);
 
         let germany = europe.regions.get("germany").unwrap();
         assert_eq!(germany.name, "Germany");
         assert_eq!(germany.geocoder_path, None);
         assert_eq!(germany.postal_path, None);
-        assert_eq!(germany.storage_size, 8175312800);
+        assert_eq!(germany.storage_size, 9272716536);
 
         let baden = germany.regions.get("baden-wuerttemberg").unwrap();
         assert_eq!(baden.name, "Baden-Württemberg");
@@ -833,5 +997,49 @@ mod tests {
         assert_eq!(data.postal_global_base, POSTAL_GLOBAL_BASE);
         assert_eq!(data.valhalla_base, VALHALLA_BASE);
         assert_eq!(data.geocoder_base, GEOCODER_BASE);
+    }
+
+    #[test]
+    fn tiles_url() {
+        let world = RegionData::new().unwrap().world_region;
+        let europe = world.regions.get("europe").unwrap();
+        let germany = europe.regions.get("germany").unwrap();
+
+        let nrw = germany.regions.get("nordrhein-westfalen").unwrap();
+        assert_eq!(nrw.tiles_url, None);
+
+        let detmold = nrw.regions.get("detmold-regbez").unwrap();
+        let tiles_url = detmold.tiles_url.as_ref().unwrap();
+        assert!(tiles_url.ends_with("/germany/nordrhein-westfalen/detmold-regbez/tiles.tar.gz"));
+    }
+
+    #[test]
+    fn tar_file_name() {
+        let path = Path::new("./should/not/matter/14_8504_5473.png");
+
+        let index = parse_tar_file_name(Cow::Borrowed(path)).unwrap();
+
+        assert_eq!(index, TileIndex::new(8504, 5473, 14));
+    }
+
+    #[test]
+    fn tar_file_name_broken() {
+        let path = Path::new("./should/not/matter/14_8504_5473.pn");
+        assert_eq!(parse_tar_file_name(Cow::Borrowed(path)), None);
+
+        let path = Path::new("./should/not/matter/14_8504s_5473.png");
+        assert_eq!(parse_tar_file_name(Cow::Borrowed(path)), None);
+
+        let path = Path::new("./should/not/matter/14_85045473.png");
+        assert_eq!(parse_tar_file_name(Cow::Borrowed(path)), None);
+
+        let path = Path::new("./should/not/matter/0.png");
+        assert_eq!(parse_tar_file_name(Cow::Borrowed(path)), None);
+
+        let path = Path::new("blub");
+        assert_eq!(parse_tar_file_name(Cow::Borrowed(path)), None);
+
+        let path = Path::new("");
+        assert_eq!(parse_tar_file_name(Cow::Borrowed(path)), None);
     }
 }

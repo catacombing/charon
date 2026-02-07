@@ -22,7 +22,7 @@
 
 The following noteworthy features are currently supported:
 
- - Raster tile maps (partially offline, tiles need to be manually loaded once)
+ - Raster tile maps (fully offline, for supported regions)
  - POI / Address search (fully offline)
  - List POIs/Addresses at location (fully offline)
  - Routing (fully offline)
@@ -70,6 +70,15 @@ it location permissions using polkit.
 
 The rule to grant these permissions to users in the `catacomb` group can be
 found in the [rules](./rules) directory.
+
+## Offline Tiles
+
+Currently offline tiles are only provided on demand, due to the high storage
+requirements of raster tiles for the whole world. If you are interested in
+offline tiles for a specific region that does not exist yet, please open an
+issue.
+
+The supported regions can be found at https://catacombing.org/tiles.
 
 ## Honorable Mentions
 

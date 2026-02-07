@@ -16,6 +16,7 @@ use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::xdg::window::{Window as XdgWindow, WindowDecorations};
 
 use crate::config::Config;
+use crate::db::Db;
 use crate::geometry::{Point, Size};
 use crate::ui::renderer::Renderer;
 use crate::ui::skia::Canvas;
@@ -56,6 +57,7 @@ impl Window {
         connection: Connection,
         queue: QueueHandle<State>,
         config: Config,
+        db: Db,
     ) -> Result<Self, Error> {
         // Get EGL display.
         let display = NonNull::new(connection.backend().display_ptr().cast()).unwrap();
@@ -86,7 +88,7 @@ impl Window {
         // Default to a reasonable default size.
         let size = Size { width: 360, height: 720 };
 
-        let views = Views::new(event_loop, &config, size)?;
+        let views = Views::new(event_loop, &config, db, size)?;
         let canvas = Canvas::new(&config);
 
         Ok(Self {

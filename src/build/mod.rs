@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::path::Path;
+use std::process::Command;
 
 use gl_generator::{Api, Fallbacks, GlobalGenerator, Profile, Registry};
 use serde::Serialize;
@@ -10,6 +12,9 @@ use crate::region::Region;
 
 mod modrana;
 mod region;
+
+/// URL of the catacomb tile archive server.
+pub const TILE_URL_BASE: &str = "https://catacombing.org/tiles";
 
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -38,8 +43,9 @@ struct Regions {
 impl Regions {
     fn new() -> Self {
         let mut modrana = Countries::new();
+        let tile_sizes = tile_sizes();
 
-        let world_region = Region::world(&mut modrana);
+        let world_region = Region::world(&mut modrana, &tile_sizes);
 
         let postal_country_base = format!("{}/{}", modrana.url.base, modrana.url.postal_country);
         let postal_global_base = format!(
@@ -52,4 +58,19 @@ impl Regions {
 
         Self { postal_country_base, postal_global_base, valhalla_base, geocoder_base, world_region }
     }
+}
+
+/// Load tile sizes from catacomb.org.
+pub fn tile_sizes() -> HashMap<String, u64> {
+    // We use `curl` here instead of reqwest since the latter causes some
+    // cross-compilation build issues.
+    let url = format!("{TILE_URL_BASE}/size");
+    let output = Command::new("curl").arg(&url).output().unwrap();
+    if !output.status.success() {
+        panic!("catacombing.org tile index download failed");
+    }
+
+    // Parse stdout as json response.
+    let response = str::from_utf8(&output.stdout).unwrap();
+    serde_json::from_str(response).expect("failed to parse tile index")
 }

@@ -27,6 +27,9 @@ pub const TILE_SIZE: i32 = 256;
 /// Maximum tile zoom level.
 pub const MAX_ZOOM: u8 = 19;
 
+/// Name of the tileserver placeholder for offline storage.
+pub const OFFLINE_TILESERVER: &str = "__offline";
+
 /// How frequently old tiles are deleted from the database.
 ///
 /// The total number of tiles in the database will always be between
@@ -113,11 +116,6 @@ impl Tiles {
         }
 
         dirty
-    }
-
-    /// Access the underlying SQLite tiles DB.
-    pub fn fs_cache(&self) -> &FsCache {
-        &self.download_state.fs_cache
     }
 }
 
@@ -474,37 +472,9 @@ impl FsCache {
         }
     }
 
-    /// Close the SQLite database connection.
-    pub async fn close(&self) {
-        let pool = self.db.pool().await;
-
-        // Defragment and truncate database file.
-        //
-        // This takes a while ~1s and blocks other database operations, so we just do it
-        // on exit.
-        if let Err(err) = sqlx::query("VACUUM").execute(pool).await {
-            error!("SQLite vacuum failed: {err}");
-        }
-
-        pool.close().await;
-    }
-
     /// Add a new tile to the cache.
     async fn insert(&self, index: TileIndex, data: &[u8]) -> Result<(), Error> {
-        #[rustfmt::skip]
-        sqlx::query(
-            "INSERT INTO tile (tileserver, x, y, z, data) \
-                VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT DO UPDATE \
-                SET data = excluded.data, ctime = unixepoch(), atime = unixepoch()",
-        )
-        .bind(&*self.tileserver)
-        .bind(index.x)
-        .bind(index.y)
-        .bind(index.z)
-        .bind(data)
-        .execute(self.db.pool().await)
-        .await?;
+        self.db.insert_tiles(&self.tileserver, &[(index, data)]).await?;
 
         // Cleanup cache every `FS_CACHE_CLEANUP_INTERVAL` inserts.
         if self.last_cleanup.fetch_add(1, Ordering::Relaxed) >= FS_CACHE_CLEANUP_INTERVAL {
@@ -521,19 +491,28 @@ impl FsCache {
 
     /// Read a tile from the cache.
     async fn get(&self, index: TileIndex) -> Result<Option<DbTile>, Error> {
+        // Get both online tileserver's and offline tile.
         #[rustfmt::skip]
-        let data = sqlx::query_as(
+        let data: Vec<DbTile> = sqlx::query_as(
             "UPDATE tile SET atime = unixepoch() \
-                WHERE tileserver = $1 AND x = $2 AND y = $3 and z = $4 \
-             RETURNING unixepoch() - ctime as age_secs, data",
+                WHERE tileserver IN ($1, $2) \
+                   AND x = $3 AND y = $4 and z = $5 \
+             RETURNING unixepoch() - ctime as age_secs, data, tileserver",
         )
         .bind(&*self.tileserver)
+        .bind(OFFLINE_TILESERVER)
         .bind(index.x)
         .bind(index.y)
         .bind(index.z)
-        .fetch_optional(self.db.pool().await)
+        .fetch_all(self.db.pool().await)
         .await?;
-        Ok(data)
+
+        // Filter offline tile if online tileserver has tile.
+        let mut iter = data.into_iter();
+        let first = iter.next();
+        let tile = iter.next().filter(|tile| tile.tileserver != OFFLINE_TILESERVER).or(first);
+
+        Ok(tile)
     }
 
     /// Perform filesystem cache cleanup.
@@ -541,9 +520,15 @@ impl FsCache {
         let pool = self.db.pool().await;
 
         // Delete least recently used tiles beyond the tile capacity.
+        #[rustfmt::skip]
         sqlx::query(
-            "DELETE FROM tile WHERE id NOT IN (SELECT id FROM tile ORDER BY atime DESC LIMIT $1)",
+            "DELETE FROM tile \
+             WHERE tileserver != $1 \
+             AND id NOT IN ( \
+                 SELECT id FROM tile WHERE tileserver != $1 ORDER BY atime DESC LIMIT $2 \
+             )",
         )
+        .bind(OFFLINE_TILESERVER)
         .bind(self.capacity)
         .execute(pool)
         .await?;
@@ -572,19 +557,21 @@ impl Clone for FsCache {
 
 /// Tile data retrieved from the database.
 struct DbTile {
+    tileserver: String,
     age_secs: u64,
     image: Image,
 }
 
 impl FromRow<'_, SqliteRow> for DbTile {
     fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
+        let tileserver = row.try_get("tileserver")?;
         let data: Vec<u8> = row.try_get("data")?;
         let age_secs = row.try_get("age_secs")?;
 
         let image = Image::from_encoded(Data::new_copy(&data))
             .ok_or_else(|| sqlx::Error::Decode("Invalid cached tile {index:?}".into()))?;
 
-        Ok(Self { age_secs, image })
+        Ok(Self { tileserver, age_secs, image })
     }
 }
 

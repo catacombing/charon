@@ -555,11 +555,6 @@ impl MapView {
         }
     }
 
-    /// Access the tile storage.
-    pub fn tiles(&self) -> &Tiles {
-        &self.tiles
-    }
-
     /// Get the current center point of the map.
     pub fn center_point(&self) -> GeoPoint {
         GeoPoint::from_tile(self.cursor_tile, self.cursor_offset)

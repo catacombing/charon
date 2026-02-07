@@ -9,6 +9,7 @@ use configory::{Manager as ConfigManager, Options as ConfigOptions};
 use profiling::puffin;
 #[cfg(feature = "profiling")]
 use puffin_http::Server;
+use reqwest::Client;
 use smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource;
 use smithay_client_toolkit::reexports::client::globals::{
     self, BindError, GlobalError, GlobalList,
@@ -24,12 +25,14 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 use crate::config::{Config, ConfigEventHandler};
+use crate::db::Db;
 use crate::ui::window::Window;
 use crate::wayland::{ProtocolStates, TextInput};
 
 mod config;
 mod db;
 mod dbus;
+mod downloader;
 mod entity_type;
 mod geocoder;
 mod geometry;
@@ -84,7 +87,7 @@ async fn run() -> Result<(), Error> {
     }
 
     // Ensure database is cleanly terminated.
-    state.window.views.map().tiles().fs_cache().close().await;
+    state.db.close().await;
 
     Ok(())
 }
@@ -102,6 +105,7 @@ struct State {
     pointer_down: bool,
 
     window: Window,
+    db: Db,
 
     /// Calloop token for GPS removal timeout.
     gps_timeout: Option<RegistrationToken>,
@@ -131,13 +135,17 @@ impl State {
             .flatten()
             .unwrap_or_default();
 
+        let db = Db::new()?;
+
         // Create the Wayland window.
-        let window = Window::new(&event_loop, &protocol_states, connection, queue, config)?;
+        let window =
+            Window::new(&event_loop, &protocol_states, connection, queue, config, db.clone())?;
 
         Ok(Self {
             protocol_states,
             event_loop,
             window,
+            db,
             _config_manager: config_manager,
             pointer_down: Default::default(),
             gps_timeout: Default::default(),
@@ -280,6 +288,17 @@ impl ClipboardState {
     }
 }
 
+/// Construct a new HTTP client.
+fn http_client() -> Result<Client, Error> {
+    // Create identifiable user agent, as required by OSM's tile usage policy.
+    let user_agent = format!(
+        "{}/{} (+https://catacombing.org; contact: charon@christianduerr.com)",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    );
+    Ok(Client::builder().user_agent(user_agent).build()?)
+}
+
 #[derive(thiserror::Error, Debug)]
 enum Error {
     #[error("{0}")]
@@ -327,6 +346,8 @@ enum Error {
     MissingCacheDir,
     #[error("Unexpected root path")]
     UnexpectedRoot,
+    #[error("Invalid offline tile map archive")]
+    InvalidTileArchive,
     #[error("Unexpected non-utf8 codepoint in path")]
     NonUtf8Path,
 }

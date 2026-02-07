@@ -4,7 +4,6 @@ use std::fmt::Write;
 use std::ops::{Deref, DerefMut};
 
 use calloop::LoopHandle;
-use reqwest::Client;
 use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers};
 
 use crate::config::Config;
@@ -125,17 +124,10 @@ impl Views {
     pub fn new(
         event_loop: &LoopHandle<'static, State>,
         config: &Config,
+        db: Db,
         size: Size,
     ) -> Result<Self, Error> {
-        // Create identifiable user agent, as required by OSM's tile usage policy.
-        let user_agent = format!(
-            "{}/{} (+https://catacombing.org; contact: charon@christianduerr.com)",
-            env!("CARGO_PKG_NAME"),
-            env!("CARGO_PKG_VERSION"),
-        );
-        let client = Client::builder().user_agent(user_agent).build()?;
-
-        let db = Db::new()?;
+        let client = crate::http_client()?;
 
         // Create geographic region manager.
         let regions = Regions::new(event_loop.clone(), client.clone(), db.clone())?;

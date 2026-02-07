@@ -1,25 +1,32 @@
 //! Geographic region stats.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 
 use indexmap::IndexMap;
 use serde::Serialize;
 
+use crate::TILE_URL_BASE;
 use crate::modrana::Countries;
+
+/// Fixed mapping between region paths and unique IDs.
+const REGION_IDS: &str = include_str!("./region_ids.json");
 
 /// Data for a geographic region.
 #[derive(Serialize, Debug)]
 pub struct Region {
+    id: u32,
     name: String,
     regions: IndexMap<String, Region>,
 
     valhalla_packages: Vec<String>,
     geocoder_path: Option<String>,
     postal_path: Option<String>,
+    tiles_url: Option<String>,
 
     // Complete size of this region and all of its children.
     storage_size: u64,
+    tiles_size: u64,
     #[serde(skip)]
     geocoder_size: u64,
     #[serde(skip)]
@@ -30,12 +37,15 @@ pub struct Region {
 
 impl Region {
     /// Get the root region of the world.
-    pub fn world(modrana: &mut Countries) -> Self {
+    pub fn world(modrana: &mut Countries, tile_sizes: &HashMap<String, u64>) -> Self {
         let postal_global_size =
             str::parse::<u64>(&modrana.postal_global.postal_global.size).unwrap();
 
-        let mut region = Region {
+        let region_ids: HashMap<String, u32> = serde_json::from_str(REGION_IDS).unwrap();
+
+        let mut world = Region {
             name: "World".into(),
+            id: 0,
             valhalla_packages: Default::default(),
             geocoder_path: Default::default(),
             geocoder_size: Default::default(),
@@ -43,12 +53,14 @@ impl Region {
             storage_size: Default::default(),
             postal_path: Default::default(),
             postal_size: Default::default(),
+            tiles_size: Default::default(),
+            tiles_url: Default::default(),
             regions: Default::default(),
         };
 
         // Convert flat modrana data map to the region tree.
         for (id, modrana_region) in mem::take(&mut modrana.regions) {
-            let mut geocoder_region = &mut region;
+            let mut region = &mut world;
 
             // Russia is the only region which has a mismatch between name and id segments,
             // so we just strip the `Europe/` to make it match.
@@ -57,13 +69,20 @@ impl Region {
                 name = name.strip_prefix("Europe/").unwrap();
             }
 
-            for (id, name) in id.split('/').zip(name.split('/')) {
+            for (relative_id, name) in id.split('/').zip(name.split('/')) {
                 // Attempt to shorten Polish region names in a reasonable way, since they're
                 // exceptionally long and contain multiple formats.
                 let name = name.find('(').map(|i| &name[..i]).unwrap_or(name);
 
-                geocoder_region =
-                    geocoder_region.regions.entry(id.into()).or_insert_with(|| Region {
+                region = region.regions.entry(relative_id.into()).or_insert_with(|| {
+                    // Get region's numerical ID from our static map.
+                    let absolute_id = &id[..id.find(relative_id).unwrap() + relative_id.len()];
+                    let id = *region_ids
+                        .get(absolute_id)
+                        .unwrap_or_else(|| panic!("missing region id for {relative_id:?}"));
+
+                    Region {
+                        id,
                         name: name.into(),
                         valhalla_packages: Default::default(),
                         geocoder_path: Default::default(),
@@ -72,30 +91,39 @@ impl Region {
                         storage_size: Default::default(),
                         postal_path: Default::default(),
                         postal_size: Default::default(),
+                        tiles_size: Default::default(),
+                        tiles_url: Default::default(),
                         regions: Default::default(),
-                    });
+                    }
+                });
             }
 
             // Set geocoder URL for this region.
             let geocoder_size = str::parse(&modrana_region.geocoder_nlp.size).unwrap();
-            geocoder_region.geocoder_path = Some(modrana_region.geocoder_nlp.path);
-            geocoder_region.geocoder_size = geocoder_size;
+            region.geocoder_path = Some(modrana_region.geocoder_nlp.path);
+            region.geocoder_size = geocoder_size;
 
             // Set valhalla packages for this region.
             let valhalla_size = str::parse(&modrana_region.valhalla.size).unwrap();
-            geocoder_region.valhalla_packages = modrana_region.valhalla.packages;
-            geocoder_region.valhalla_size = valhalla_size;
+            region.valhalla_packages = modrana_region.valhalla.packages;
+            region.valhalla_size = valhalla_size;
 
             // Set libpostal URL for this region's language.
             let postal_size = str::parse(&modrana_region.postal_country.size).unwrap();
-            geocoder_region.postal_path = Some(modrana_region.postal_country.path);
-            geocoder_region.postal_size = postal_size;
+            region.postal_path = Some(modrana_region.postal_country.path);
+            region.postal_size = postal_size;
+
+            // Set tile data for this region.
+            if let Some(tile_size) = tile_sizes.get(&id) {
+                region.tiles_url = Some(format!("{TILE_URL_BASE}/{id}/tiles.tar.gz"));
+                region.tiles_size += tile_size;
+            }
         }
 
         // Recursively update storage size and sort regions.
-        region.postprocess(postal_global_size);
+        world.postprocess(postal_global_size);
 
-        region
+        world
     }
 
     /// Process region list into more optimal storage format.
@@ -103,64 +131,72 @@ impl Region {
     fn postprocess(
         &mut self,
         postal_global_size: u64,
-    ) -> (HashSet<(String, u64)>, HashSet<(String, u64)>, u64) {
-        // Handle regions with postal/geocoder/valhalla data available.
-        if self.postal_size != 0 && self.geocoder_size != 0 && self.valhalla_size != 0 {
-            // Ensure regions are stored in reverse alphabetical order.
-            self.regions.sort_unstable_by(|k1, _, k2, _| k2.cmp(k1));
-
-            // Ensure children are updated, even if this region doesn't use that data.
-            for region in self.regions.values_mut() {
-                region.postprocess(postal_global_size);
-            }
-
-            // Update this region's storage size.
-            self.storage_size =
-                self.geocoder_size + self.valhalla_size + self.postal_size + postal_global_size;
-
-            // Get valhalla package sizes.
-            // Since we only get the combined size, we approximate things by dividing it
-            // evenly.
-            let avg_size = self.valhalla_size / self.valhalla_packages.len() as u64;
-            let valhalla_packages =
-                self.valhalla_packages.clone().into_iter().map(|p| (p, avg_size)).collect();
-
-            // Return size of this region's postal, valhalla, and geocoder data.
-            let mut postal_countries = HashSet::new();
-            postal_countries.insert((self.postal_path.clone().unwrap(), self.postal_size));
-            return (postal_countries, valhalla_packages, self.geocoder_size);
-        }
-
+    ) -> (HashSet<(String, u64)>, HashSet<(String, u64)>, u64, u64) {
         // Ensure regions are stored in reverse alphabetical order.
         self.regions.sort_unstable_by(|k1, _, k2, _| k2.cmp(k1));
 
-        // Calculate geocoder and postal size from children.
+        let has_valhalla = self.valhalla_size != 0;
+        let has_geocoder = self.geocoder_size != 0;
+        let has_postal = self.postal_size != 0;
+        let has_tiles = self.tiles_url.is_some();
+
         let mut valhalla_packages = HashSet::new();
         let mut postal_countries = HashSet::new();
+
+        // Calculate geocoder and postal size from children.
         for region in self.regions.values_mut() {
-            // Add geocoder size.
-            let (countries, packages, geocoder_size) = region.postprocess(postal_global_size);
-            self.geocoder_size += geocoder_size;
+            // Get subregion sizes.
+            let (countries, packages, tile_size, geocoder_size) =
+                region.postprocess(postal_global_size);
+
+            if !has_tiles {
+                self.tiles_size += tile_size;
+            }
+
+            if !has_geocoder {
+                self.geocoder_size += geocoder_size;
+            }
 
             // Add postal size for each new postal country.
-            for (country, country_size) in countries {
-                if postal_countries.insert((country, country_size)) {
-                    self.postal_size += country_size;
+            if !has_postal {
+                for (country, country_size) in countries {
+                    if postal_countries.insert((country, country_size)) {
+                        self.postal_size += country_size;
+                    }
                 }
             }
 
             // Add valhalla size for each new package.
-            for (package, package_size) in packages {
-                if valhalla_packages.insert((package, package_size)) {
-                    self.valhalla_size += package_size;
+            if !has_valhalla {
+                for (package, package_size) in packages {
+                    if valhalla_packages.insert((package, package_size)) {
+                        self.valhalla_size += package_size;
+                    }
                 }
             }
         }
 
-        // Update this node's combined storage size.
-        self.storage_size =
-            self.geocoder_size + self.valhalla_size + self.postal_size + postal_global_size;
+        // Get valhalla package sizes.
+        //
+        // Since we only have the combined size, we approximate by dividing it evenly.
+        if has_valhalla {
+            let avg_size = self.valhalla_size / self.valhalla_packages.len() as u64;
+            valhalla_packages =
+                self.valhalla_packages.clone().into_iter().map(|p| (p, avg_size)).collect();
+        }
 
-        (postal_countries, valhalla_packages, self.geocoder_size)
+        // Return size of this region's postal, valhalla, tile, and geocoder data.
+        if has_postal {
+            postal_countries.insert((self.postal_path.clone().unwrap(), self.postal_size));
+        }
+
+        // Update this node's combined storage size.
+        self.storage_size = self.geocoder_size
+            + self.valhalla_size
+            + self.postal_size
+            + self.tiles_size
+            + postal_global_size;
+
+        (postal_countries, valhalla_packages, self.tiles_size, self.geocoder_size)
     }
 }

@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - Scaled parent tiles are now used as placeholder when tiles cannot be loaded
+- Offline tile download and storage
 
 ### Fixed
 
