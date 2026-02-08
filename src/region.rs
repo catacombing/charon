@@ -53,6 +53,13 @@ const POSTAL_GLOBAL_FILES: &[&str] = &[
     "numex/numex.dat",
 ];
 
+/// SmallVec wrapper for storing up to 100 values on the stack.
+///
+/// The most amount of subregions for any region is under 60, so with a stack
+/// size of 100 this should mean the `offline_tiles` smallvec never uses the
+/// heap.
+type OfflineTilesVec<T> = SmallVec<[T; 100]>;
+
 /// Region data management.
 pub struct Regions {
     data: RegionData,
@@ -203,25 +210,7 @@ impl Regions {
         }
 
         // Import offline raster map tiles.
-        //
-        // This is done recursively for all tiles, since tiles are only stored at the
-        // bottommost region level.
-        let mut offline_tiles = SmallVec::new();
-        region.offline_tiles(&mut offline_tiles);
-        for (region, url) in offline_tiles {
-            // Add progress tracking for tile decompression/DB inserts.
-            tracker.add_download(region.tiles_size);
-
-            let client = self.client.clone();
-            let tracker = tracker.clone();
-            let region_id = region.id;
-            let url = url.to_string();
-            let db = self.db.clone();
-
-            downloads.spawn(async move {
-                Self::download_map_tiles(client, tracker, db, region_id, &url).await
-            });
-        }
+        self.download_map_tiles(region, &tracker, &mut downloads);
 
         // Wait for all downloads to complete.
         //
@@ -400,21 +389,113 @@ impl Regions {
         Ok(())
     }
 
-    /// Download offline map tiles to the DB.
-    async fn download_map_tiles(
+    /// Download and import raster map tiles.
+    ///
+    /// Map tile download is done recursively for all regions, since tile
+    /// archives are only stored at the bottommost region level.
+    fn download_map_tiles(
+        &self,
+        region: &Region,
+        tracker: &DownloadTracker,
+        downloads: &mut JoinSet<Result<(), Error>>,
+    ) {
+        // Recursively get all offline tile archives.
+        let mut offline_tiles = SmallVec::new();
+        region.offline_tiles(&mut offline_tiles);
+
+        // Immediately add progress tracking for tile decompression/DB inserts.
+        for (region, _) in &offline_tiles {
+            tracker.add_download(region.tiles_size);
+        }
+
+        // Collect relevant tile data which can be sent across threads.
+        let offline_tiles: OfflineTilesVec<_> =
+            offline_tiles.into_iter().map(|(region, url)| (region.id, url)).collect();
+
+        let client = self.client.clone();
+        let tracker = tracker.clone();
+        let db = self.db.clone();
+
+        downloads.spawn(async move {
+            // Initially, stage all archives as pending downloads.
+            let pending_downloads = offline_tiles.into_iter().map(|(region_id, url)| {
+                let tracker = tracker.clone();
+                let client = client.clone();
+                async move {
+                    let tempfile = Self::download_map_archive(client, tracker, url).await?;
+                    Ok(Some((region_id, tempfile)))
+                }
+            });
+
+            let mut tasks: JoinSet<Result<Option<(u32, NamedTempFile)>, Error>> = JoinSet::new();
+            let mut pending_downloads = pending_downloads.into_iter();
+            let mut pending_parses = OfflineTilesVec::new();
+
+            // Download and parse archives, having at most one archive downloading and one
+            // archive parsing at a time to avoid request/SQLite errors.
+            loop {
+                match tasks.join_next().await {
+                    Some(Err(err)) => return Err(err.into()),
+                    Some(Ok(Err(err))) => return Err(err),
+                    // Handle download task completion.
+                    Some(Ok(Ok(Some((region_id, tempfile))))) => {
+                        // Add new archive to the parsing backlog.
+                        let tracker = tracker.clone();
+                        let db = db.clone();
+                        pending_parses.push(async move {
+                            let path = tempfile.path();
+                            Self::parse_map_archive(tracker, db, region_id, path).await?;
+                            Ok(None)
+                        });
+
+                        // Start next download task if available.
+                        if let Some(pending_download) = pending_downloads.next() {
+                            tasks.spawn(pending_download);
+                        }
+                    },
+                    // Handle parsing task completion.
+                    Some(Ok(Ok(None))) => {
+                        if !pending_parses.is_empty() {
+                            tasks.spawn(pending_parses.swap_remove(0));
+                        }
+                    },
+                    // Stage next available tasks once backlog is cleared.
+                    None => {
+                        // Start next download task if available.
+                        if let Some(pending_download) = pending_downloads.next() {
+                            tasks.spawn(pending_download);
+                        }
+
+                        // Start next parsing task if available.
+                        if !pending_parses.is_empty() {
+                            tasks.spawn(pending_parses.swap_remove(0));
+                        }
+
+                        // Once no more tasks are available, we're done.
+                        if tasks.is_empty() {
+                            break;
+                        }
+                    },
+                }
+            }
+
+            Ok(())
+        });
+    }
+
+    /// Download offline map tiles archive to a tempfile.
+    async fn download_map_archive(
         client: Client,
         tracker: DownloadTracker,
-        db: Db,
-        region_id: u32,
-        url: &str,
-    ) -> Result<(), Error> {
+        url: Arc<String>,
+    ) -> Result<NamedTempFile, Error> {
         // NOTE: We stream to a file here which is technically pointless and will just
         // slow us down, but unfortunately Rust does not have a mature tar library that
         // can handle streaming.
         //
         // See: https://github.com/alexcrichton/tar-rs/issues/427
 
-        let mut response = client.get(url).send().await?.error_for_status()?;
+        let mut response = client.get(&*url).send().await?.error_for_status()?;
 
         // Add download size to progress tracker.
         let content_length = response
@@ -424,16 +505,27 @@ impl Regions {
             .unwrap_or(0);
         tracker.add_download(content_length);
 
-        let mut tempfile = NamedTempFile::new()?;
+        let tempfile = NamedTempFile::new()?;
+        let mut write_tempfile = File::create(tempfile.path()).await?;
 
-        // Stream data to file in chunks.
+        // Stream data to file.
         while let Some(chunk) = response.chunk().await? {
             tracker.add_progress(chunk.len() as u64);
-            tempfile.as_file_mut().write_all(&chunk)?;
+            io::copy(&mut &*chunk, &mut write_tempfile).await?;
         }
 
+        Ok(tempfile)
+    }
+
+    /// Parse map tile data from a tar archive.
+    async fn parse_map_archive(
+        tracker: DownloadTracker,
+        db: Db,
+        region_id: u32,
+        path: &Path,
+    ) -> Result<(), Error> {
         // XXX: This must reopen file, to reset read cursor position.
-        let mut file = File::open(tempfile.path()).await?;
+        let mut file = File::open(path).await?;
 
         // Write tile data in batches to improve performance.
         const MAX_BATCH_SIZE: usize = 1_000;
@@ -454,7 +546,8 @@ impl Regions {
             }
 
             // Stage this tile for writing.
-            let tile_index = parse_tar_file_name(entry.path()?).ok_or(Error::InvalidTileArchive)?;
+            let tile_index =
+                parse_tar_tile_file_name(entry.path()?).ok_or(Error::InvalidTileArchive)?;
             let mut tile_data = Vec::new();
             entry.read_to_end(&mut tile_data).await?;
             tracker.add_progress(tile_data.len() as u64);
@@ -581,7 +674,7 @@ pub struct Region {
     valhalla_packages: Vec<String>,
     geocoder_path: Option<String>,
     postal_path: Option<String>,
-    tiles_url: Option<String>,
+    tiles_url: Option<Arc<String>>,
     tiles_size: u64,
 
     #[serde(skip)]
@@ -844,9 +937,9 @@ impl Region {
     }
 
     /// Get ID and download URL for all child regions with offline tile data.
-    fn offline_tiles<'a>(&'a self, tiles: &mut SmallVec<[(&'a Self, &'a str); 100]>) {
+    fn offline_tiles<'a>(&'a self, tiles: &mut OfflineTilesVec<(&'a Self, Arc<String>)>) {
         if let Some(tiles_url) = &self.tiles_url {
-            tiles.push((self, tiles_url));
+            tiles.push((self, tiles_url.clone()));
         }
 
         for region in self.regions.values() {
@@ -924,7 +1017,7 @@ impl DownloadTracker {
 /// Parse the filename of a tile in an offlin map archive.
 ///
 /// Example: `0_1_2.png` => TileIndex::new(1, 2, 0)
-fn parse_tar_file_name(path: Cow<'_, Path>) -> Option<TileIndex> {
+fn parse_tar_tile_file_name(path: Cow<'_, Path>) -> Option<TileIndex> {
     let file_name = path.file_name()?.to_str()?;
 
     // Strip extension.
@@ -1014,32 +1107,32 @@ mod tests {
     }
 
     #[test]
-    fn tar_file_name() {
+    fn tar_tile_file_name() {
         let path = Path::new("./should/not/matter/14_8504_5473.png");
 
-        let index = parse_tar_file_name(Cow::Borrowed(path)).unwrap();
+        let index = parse_tar_tile_file_name(Cow::Borrowed(path)).unwrap();
 
         assert_eq!(index, TileIndex::new(8504, 5473, 14));
     }
 
     #[test]
-    fn tar_file_name_broken() {
+    fn tar_tile_file_name_broken() {
         let path = Path::new("./should/not/matter/14_8504_5473.pn");
-        assert_eq!(parse_tar_file_name(Cow::Borrowed(path)), None);
+        assert_eq!(parse_tar_tile_file_name(Cow::Borrowed(path)), None);
 
         let path = Path::new("./should/not/matter/14_8504s_5473.png");
-        assert_eq!(parse_tar_file_name(Cow::Borrowed(path)), None);
+        assert_eq!(parse_tar_tile_file_name(Cow::Borrowed(path)), None);
 
         let path = Path::new("./should/not/matter/14_85045473.png");
-        assert_eq!(parse_tar_file_name(Cow::Borrowed(path)), None);
+        assert_eq!(parse_tar_tile_file_name(Cow::Borrowed(path)), None);
 
         let path = Path::new("./should/not/matter/0.png");
-        assert_eq!(parse_tar_file_name(Cow::Borrowed(path)), None);
+        assert_eq!(parse_tar_tile_file_name(Cow::Borrowed(path)), None);
 
         let path = Path::new("blub");
-        assert_eq!(parse_tar_file_name(Cow::Borrowed(path)), None);
+        assert_eq!(parse_tar_tile_file_name(Cow::Borrowed(path)), None);
 
         let path = Path::new("");
-        assert_eq!(parse_tar_file_name(Cow::Borrowed(path)), None);
+        assert_eq!(parse_tar_tile_file_name(Cow::Borrowed(path)), None);
     }
 }
