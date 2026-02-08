@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 - Not starting with missing cache directory
+- Crashing on startup due to improper Wayland initialization order
 
 ## 1.4.0 - 2026-01-22
 

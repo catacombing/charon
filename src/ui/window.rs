@@ -44,7 +44,7 @@ pub struct Window {
     size: Size,
     scale: f64,
 
-    initial_draw_done: bool,
+    initial_configure_done: bool,
     text_input_dirty: bool,
     stalled: bool,
     dirty: bool,
@@ -104,7 +104,7 @@ impl Window {
             stalled: true,
             dirty: true,
             scale: 1.,
-            initial_draw_done: Default::default(),
+            initial_configure_done: Default::default(),
             text_input_dirty: Default::default(),
             text_input: Default::default(),
             ime_cause: Default::default(),
@@ -119,11 +119,10 @@ impl Window {
         profiling::finish_frame!();
 
         // Stall rendering if nothing changed since last redraw.
-        if !self.dirty() {
+        if !self.dirty() || !self.initial_configure_done {
             self.stalled = true;
             return;
         }
-        self.initial_draw_done = true;
         self.dirty = false;
 
         self.update_text_input();
@@ -153,13 +152,6 @@ impl Window {
         wl_surface.commit();
     }
 
-    /// Perform draw for the initial commit.
-    pub fn perform_initial_draw(&mut self) {
-        if !self.initial_draw_done {
-            self.draw();
-        }
-    }
-
     /// Unstall the renderer.
     ///
     /// This will render a new frame if there currently is no frame request
@@ -184,6 +176,7 @@ impl Window {
             view.set_size(size);
         }
 
+        self.initial_configure_done = true;
         self.size = size;
         self.dirty = true;
 

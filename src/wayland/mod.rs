@@ -186,9 +186,6 @@ impl WindowHandler for State {
             let size = Size::new(width.get(), height.get());
             self.window.set_size(&self.protocol_states.compositor, size);
         }
-
-        // Ensure we draw at least once after initial configure.
-        self.window.perform_initial_draw();
     }
 }
 delegate_xdg_window!(State);
