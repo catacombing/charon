@@ -136,6 +136,15 @@ impl Db {
     pub async fn close(&self) {
         let pool = self.pool().await;
 
+        // Store query planner optimization details on exit.
+        //
+        // While the sqlx connection options for sqlite allow doing this automatically
+        // on close, doing this manually allows us to control when exactly it is run and
+        // write potential errors to our log.
+        if let Err(err) = sqlx::query("PRAGMA optimize").execute(pool).await {
+            error!("SQLite optimize failed: {err}");
+        }
+
         // Defragment and truncate database file.
         //
         // This takes a while ~1s and blocks other database operations, so we just do it

@@ -65,7 +65,13 @@ impl Tiles {
         // Initialize filesystem cache and remove outdated maps.
         let fs_cache = FsCache::new(config, db);
         let cleanup_cache = fs_cache.clone();
-        tokio::spawn(async move { cleanup_cache.clean_cache().await });
+        tokio::spawn(async move {
+            // Delay initial cache cleanup to avoid locking up the database with an
+            // expensive query just before the first tile loads are attempted.
+            time::sleep(Duration::from_secs(3)).await;
+
+            cleanup_cache.clean_cache().await
+        });
 
         let download_state =
             DownloadState { fs_cache, tile_tx, client, server: config.tiles.server.clone() };
