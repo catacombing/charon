@@ -11,14 +11,13 @@ use calloop::{LoopHandle, RegistrationToken};
 use reqwest::Client;
 use skia_safe::textlayout::TextAlign;
 use skia_safe::{
-    ClipOp, Color4f, FilterMode, MipmapMode, Paint, PaintCap, PaintJoin, PathBuilder, Rect,
+    ClipOp, Color4f, FilterMode, MipmapMode, Paint, PaintCap, PaintJoin, Path, PathBuilder, Rect,
     SamplingOptions,
 };
 use tracing::error;
 
 use crate::config::{Config, Input};
 use crate::db::Db;
-use crate::dbus::modem_manager;
 use crate::geometry::{self, GeoPoint, Point, Size, rect_intersects_line};
 use crate::router::{Mode as RouteMode, Route};
 use crate::tiles::{MAX_ZOOM, TILE_SIZE, TileIndex, TileIter, Tiles};
@@ -27,7 +26,7 @@ use crate::ui::view::map::route::MapRoute;
 use crate::ui::view::search::RouteOrigin;
 use crate::ui::view::{self, UiView, View};
 use crate::ui::{Button, Svg, Velocity};
-use crate::{Error, State};
+use crate::{Error, State, dbus};
 
 /// Button width and height at scale 1.
 const BUTTON_SIZE: u32 = 48;
@@ -99,6 +98,7 @@ pub struct MapView {
     poi: Option<RenderGeoPoint>,
     route: Option<MapRoute>,
     last_reroute: Instant,
+    heading: Option<f32>,
     rerouting: bool,
 
     cursor_tile: TileIndex,
@@ -192,6 +192,7 @@ impl MapView {
             touch_state: Default::default(),
             gps_locked: Default::default(),
             rerouting: Default::default(),
+            heading: Default::default(),
             route: Default::default(),
             gps: Default::default(),
             poi: Default::default(),
@@ -328,7 +329,7 @@ impl MapView {
         let poi_tile = self.poi.as_mut().map(|poi| poi.tile(self.cursor_tile.z));
         let poi_point = poi_tile.and_then(|(tile, offset)| iter.screen_point(tile, offset));
         if let Some(point) = poi_point {
-            // Draw circle border.
+            // Draw border.
             self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
             let rect = Rect::new(
                 point.x as f32 - border_size / 2.,
@@ -338,7 +339,7 @@ impl MapView {
             );
             render_state.draw_rect(rect, &self.tile_paint);
 
-            // Draw circle fill.
+            // Draw fill.
             self.tile_paint.set_color4f(Color4f::from(config.colors.highlight), None);
             let rect = Rect::new(
                 point.x as f32 - fill_size / 2.,
@@ -349,17 +350,43 @@ impl MapView {
             render_state.draw_rect(rect, &self.tile_paint);
         }
 
-        // Draw GPS circle.
+        // Draw GPS circle/arrow.
         let gps_tile = self.gps.as_mut().map(|gps| gps.tile(self.cursor_tile.z));
         let gps_point = gps_tile.and_then(|(tile, offset)| iter.screen_point(tile, offset));
         if let Some(point) = gps_point {
-            // Draw circle border.
-            self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
-            render_state.draw_circle(point, border_size / 2., &self.tile_paint);
+            let point: Point<f32> = point.into();
+            match self.heading {
+                Some(heading) => {
+                    // Get triangle points by rotating relative points around the center.
+                    let width = fill_size * 0.75;
+                    let points = [
+                        (point + Point::new(0., -fill_size / 2.).rotate(heading)).into(),
+                        (point + Point::new(-width / 2., fill_size / 2.).rotate(heading)).into(),
+                        (point + Point::new(width / 2., fill_size / 2.).rotate(heading)).into(),
+                    ];
+                    let path = Path::polygon(&points, true, None, true);
 
-            // Draw circle fill.
-            self.tile_paint.set_color4f(Color4f::from(config.colors.highlight), None);
-            render_state.draw_circle(point, fill_size / 2., &self.tile_paint);
+                    // Draw border.
+                    self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
+                    self.tile_paint.set_stroke_width(border_size - fill_size);
+                    self.tile_paint.set_stroke(true);
+                    render_state.draw_path(&path, &self.tile_paint);
+
+                    // Draw fill.
+                    self.tile_paint.set_color4f(Color4f::from(config.colors.highlight), None);
+                    self.tile_paint.set_stroke(false);
+                    render_state.draw_path(&path, &self.tile_paint);
+                },
+                None => {
+                    // Draw border.
+                    self.tile_paint.set_color4f(Color4f::from(config.colors.background), None);
+                    render_state.draw_circle(point, border_size / 2., &self.tile_paint);
+
+                    // Draw fill.
+                    self.tile_paint.set_color4f(Color4f::from(config.colors.highlight), None);
+                    render_state.draw_circle(point, fill_size / 2., &self.tile_paint);
+                },
+            }
         }
     }
 
@@ -600,7 +627,7 @@ impl MapView {
 
     /// Update the GPS indicator location.
     #[cfg_attr(feature = "profiling", profiling::function)]
-    pub fn set_gps(&mut self, point: Option<GeoPoint>) {
+    pub fn set_gps(&mut self, point: Option<GeoPoint>, heading: Option<f64>) {
         let point = match point.map(RenderGeoPoint::from) {
             // Ignore GPS positions matching the current state.
             point if point.as_ref() == self.gps.as_ref() => return,
@@ -657,6 +684,7 @@ impl MapView {
             }
         }
 
+        self.heading = heading.map(|h| h as f32);
         self.gps = Some(point);
         self.dirty = true;
     }
@@ -956,15 +984,15 @@ impl MapView {
 
         // Listen for new GPS location updates in the background.
         tokio::spawn(async move {
-            if let Err(err) = modem_manager::gps_listen(gps_tx).await {
-                error!("DBus GPS error: {err}");
+            if let Err(err) = dbus::dbus_listen(gps_tx).await {
+                error!("DBus error: {err}");
             }
         });
 
         // Forward new GPS locations.
         event_loop.insert_source(gps_rx, |event, _, state| {
-            let location = match event {
-                Event::Msg(location) => location,
+            let (location, heading) = match event {
+                Event::Msg(msg) => msg,
                 Event::Closed => return,
             };
 
@@ -976,16 +1004,16 @@ impl MapView {
                         state.event_loop.remove(token);
                     }
 
+                    state.window.views.map().set_gps(Some(location), heading);
                     state.window.views.search().set_gps(Some(location));
-                    state.window.views.map().set_gps(Some(location));
                     state.window.unstall();
                 },
                 // Delay GPS removal by `GPS_TIMEOUT`.
                 None => {
                     let timer = Timer::from_duration(GPS_TIMEOUT);
                     let token = state.event_loop.insert_source(timer, move |_, _, state| {
+                        state.window.views.map().set_gps(None, None);
                         state.window.views.search().set_gps(None);
-                        state.window.views.map().set_gps(None);
                         state.window.unstall();
 
                         TimeoutAction::Drop

@@ -4,12 +4,11 @@ use std::collections::HashMap;
 use std::future;
 use std::time::Duration;
 
-use calloop::channel::Sender;
 use futures_lite::stream::StreamExt;
 use tokio::task::JoinSet;
-use tokio::time::{self, Interval};
+use tokio::time::{self, Interval, MissedTickBehavior};
 use tracing::{error, info};
-use zbus::fdo::ObjectManagerProxy;
+use zbus::fdo::{InterfacesAddedStream, InterfacesRemovedStream, ObjectManagerProxy};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Type, Value};
 use zbus::{Connection, proxy};
 
@@ -19,43 +18,54 @@ use crate::geometry::GeoPoint;
 /// Minimum GPS refresh rate, since we don't want to poll too much.
 const MIN_GPS_REFRESH: Duration = Duration::from_secs(1);
 
-/// Listen for GPS location updates
-pub async fn gps_listen(tx: Sender<Option<GeoPoint>>) -> Result<(), Error> {
-    let connection = Connection::system().await?;
+/// Modem manager GPS location source.
+pub struct ModemGpsSource {
+    modem_removed_stream: InterfacesRemovedStream,
+    modem_added_stream: InterfacesAddedStream,
 
-    // Create object manager for modem changes.
-    let object_manager = ObjectManagerProxy::builder(&connection)
-        .destination("org.freedesktop.ModemManager1")?
-        .path("/org/freedesktop/ModemManager1")?
-        .build()
-        .await?;
+    object_manager: ObjectManagerProxy<'static>,
+    proxies: Vec<LocationProxy<'static>>,
 
-    // Fill list of active location proxies.
-    let mut proxies = location_proxies(&connection, &object_manager).await;
+    refresh_rate: Option<Interval>,
+}
 
-    // Get stream for modem changes.
-    let mut modem_added_stream = object_manager.receive_interfaces_added().await?;
-    let mut modem_removed_stream = object_manager.receive_interfaces_removed().await?;
+impl ModemGpsSource {
+    pub async fn new(connection: &Connection) -> Result<Self, Error> {
+        // Create object manager for modem changes.
+        let object_manager = ObjectManagerProxy::builder(connection)
+            .destination("org.freedesktop.ModemManager1")?
+            .path("/org/freedesktop/ModemManager1")?
+            .build()
+            .await?;
 
-    // Get GPS refresh rate.
-    let mut refresh_rate = gps_refresh_rate(&proxies).await;
+        // Fill list of active location proxies.
+        let proxies = location_proxies(connection, &object_manager).await;
 
-    let log_refresh_rate = |refresh_rate: &Option<Interval>| match refresh_rate {
-        Some(refresh_rate) => {
-            let refresh_rate = refresh_rate.period().as_secs();
-            info!("Updated modem GPS polling rate to {refresh_rate}s");
-        },
-        None => info!("Paused modem GPS polling; no GPS source present"),
-    };
-    info!("Started modem GPS pollin");
-    log_refresh_rate(&refresh_rate);
+        // Get stream for modem changes.
+        let modem_added_stream = object_manager.receive_interfaces_added().await?;
+        let modem_removed_stream = object_manager.receive_interfaces_removed().await?;
 
-    // Transmit initial location.
-    let _ = tx.send(location(&proxies).await);
+        // Get GPS refresh rate.
+        let refresh_rate = gps_refresh_rate(&proxies).await;
 
-    loop {
+        info!("Started modem GPS polling");
+
+        let source = Self {
+            modem_removed_stream,
+            modem_added_stream,
+            object_manager,
+            refresh_rate,
+            proxies,
+        };
+        source.log_refresh_rate();
+
+        Ok(source)
+    }
+
+    /// Process the next modem GPS update.
+    pub async fn listen(&mut self, connection: &Connection) {
         let next_refresh = async {
-            match &mut refresh_rate {
+            match &mut self.refresh_rate {
                 Some(refresh_rate) => refresh_rate.tick().await,
                 None => future::pending().await,
             }
@@ -66,58 +76,88 @@ pub async fn gps_listen(tx: Sender<Option<GeoPoint>>) -> Result<(), Error> {
             _ = next_refresh => (),
 
             // Wait for GPS property changes.
-            _ = properties_changed(&proxies) => {
-                refresh_rate = gps_refresh_rate(&proxies).await;
-                log_refresh_rate(&refresh_rate);
+            _ = properties_changed(&self.proxies) => {
+                self.refresh_rate = gps_refresh_rate(&self.proxies).await;
+                self.log_refresh_rate();
             },
 
             // Wait for new/removed modems.
-            Some(_) = modem_added_stream.next() => {
-                proxies = location_proxies(&connection, &object_manager).await;
-                refresh_rate = gps_refresh_rate(&proxies).await;
-                log_refresh_rate(&refresh_rate);
+            Some(_) = self.modem_added_stream.next() => {
+                self.proxies = location_proxies(connection, &self.object_manager).await;
+                self.refresh_rate = gps_refresh_rate(&self.proxies).await;
+                self.log_refresh_rate();
             },
-            Some(_) = modem_removed_stream.next() => {
-                proxies = location_proxies(&connection, &object_manager).await;
-                refresh_rate = gps_refresh_rate(&proxies).await;
-                log_refresh_rate(&refresh_rate);
-            },
-
-            else => continue,
-        };
-
-        // Publish new location event.
-        if tx.send(location(&proxies).await).is_err() {
-            // If the channel was closed, we terminate.
-            return Ok(());
-        }
-    }
-}
-
-/// Get GPS location from a list of location proxies.
-async fn location(proxies: &[LocationProxy<'_>]) -> Option<GeoPoint> {
-    // Return data from first modem with raw GPS enabled.
-    let gps_raw = ModemLocationSource::GpsRaw as u32;
-    for proxy in proxies {
-        // Log errors, to indicate missing polkit permissions.
-        let locations = match proxy.get_location().await {
-            Ok(locations) => locations,
-            Err(err) => {
-                error!("Failed to get modem location: {err}");
-                continue;
+            Some(_) = self.modem_removed_stream.next() => {
+                self.proxies = location_proxies(connection, &self.object_manager).await;
+                self.refresh_rate = gps_refresh_rate(&self.proxies).await;
+                self.log_refresh_rate();
             },
         };
-
-        if let Some(location) = locations.get(&gps_raw)
-            && let Value::Dict(dict) = &**location
-            && let Ok(Some(lat)) = dict.get(&"latitude")
-            && let Ok(Some(lon)) = dict.get(&"longitude")
-        {
-            return Some(GeoPoint::new(lat, lon));
-        }
     }
 
-    None
+    /// Get the current GPS location.
+    pub async fn location(&self) -> Option<GeoPoint> {
+        // Return data from first modem with raw GPS enabled.
+        let gps_nmea = ModemLocationSource::GpsNmea as u32;
+        let gps_raw = ModemLocationSource::GpsRaw as u32;
+        for proxy in &self.proxies {
+            // Log errors, to indicate missing polkit permissions.
+            let locations = match proxy.get_location().await {
+                Ok(locations) => locations,
+                Err(err) => {
+                    error!("Failed to get modem location: {err}");
+                    continue;
+                },
+            };
+
+            // Try to parse location as any of the supported GPS formats.
+            if let Some(location) = locations.get(&gps_raw)
+                && let Value::Dict(dict) = &**location
+                && let Ok(Some(lat)) = dict.get(&"latitude")
+                && let Ok(Some(lon)) = dict.get(&"longitude")
+            {
+                return Some(GeoPoint::new(lat, lon));
+            } else if let Some(location) = locations.get(&gps_nmea)
+                && let Value::Str(s) = &**location
+                && let Some(start_offset) = s.find("$GPGGA")
+            {
+                // Extract latitude and longitude from NMEA $GPGGA string.
+                //
+                // Example:
+                // ```
+                // $GPGGA,134658.00,5106.9792,N,11402.3003,W,2,09,1.0,1048.47,M,-16.27,M,08,AAAA*60
+                // ```
+                let mut fields = s[start_offset..].split(',');
+                let _header = fields.next();
+                let _utc = fields.next();
+                let lat_str = fields.next();
+                let _lat_dir = fields.next();
+                let lon_str = fields.next();
+
+                let lat_nmea = lat_str.and_then(|lat| lat.parse().ok());
+                let lon_nmea = lon_str.and_then(|lon| lon.parse().ok());
+
+                if let Some((lat_nmea, lon_nmea)) = lat_nmea.zip(lon_nmea) {
+                    let lat = parse_nmea_coord(lat_nmea);
+                    let lon = parse_nmea_coord(lon_nmea);
+                    return Some(GeoPoint::new(lat, lon));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Log current modem refresh rate.
+    fn log_refresh_rate(&self) {
+        match &self.refresh_rate {
+            Some(refresh_rate) => {
+                let refresh_rate = refresh_rate.period().as_secs();
+                info!("Updated modem GPS polling rate to {refresh_rate}s");
+            },
+            None => info!("Paused modem GPS polling; no GPS source present"),
+        }
+    }
 }
 
 /// Get the minimum refresh interval from a list of location proxies.
@@ -129,9 +169,11 @@ async fn gps_refresh_rate(proxies: &[LocationProxy<'_>]) -> Option<Interval> {
     let mut min_secs = None;
 
     // Find shortest refresh interval from all proxies.
+    let gps_nmea = ModemLocationSource::GpsNmea as u32;
     let gps_raw = ModemLocationSource::GpsRaw as u32;
     for proxy in proxies {
-        if proxy.enabled().await.is_ok_and(|enabled| enabled & gps_raw != 0)
+        let enabled = proxy.enabled().await;
+        if enabled.is_ok_and(|enabled| enabled & gps_raw != 0 || enabled & gps_nmea != 0)
             && let Ok(refresh_rate) = proxy.gps_refresh_rate().await
             && min_secs.is_none_or(|min| min >= refresh_rate)
         {
@@ -139,7 +181,12 @@ async fn gps_refresh_rate(proxies: &[LocationProxy<'_>]) -> Option<Interval> {
         }
     }
 
-    min_secs.map(|secs| time::interval(Duration::from_secs(secs as u64).max(MIN_GPS_REFRESH)))
+    // Configure interval to fire at most once when any amount of ticks have passed.
+    let duration = Duration::from_secs(min_secs? as u64).max(MIN_GPS_REFRESH);
+    let mut interval = time::interval(duration);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    Some(interval)
 }
 
 /// Await GPS-related modem property changes.
@@ -198,6 +245,17 @@ async fn location_from_path(
     device_path: OwnedObjectPath,
 ) -> zbus::Result<LocationProxy<'static>> {
     LocationProxy::builder(connection).path(device_path)?.build().await
+}
+
+/// Convert NMEA latitude/longitude format to traditional degrees.
+///
+/// The NMEA format for coordinates uses minutes (1 degree = 60 minutes) in the
+/// format `DDmm.mm`, so the minutes must be converted first to get accurate
+/// coordinates.
+fn parse_nmea_coord(coordinate: f64) -> f64 {
+    let degrees = (coordinate / 100.).trunc();
+    let minutes = coordinate - degrees * 100.;
+    degrees + minutes / 60.
 }
 
 #[proxy(

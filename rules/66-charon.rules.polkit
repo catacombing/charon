@@ -5,4 +5,11 @@ polkit.addRule(function(action, subject) {
     {
         return polkit.Result.YES;
     }
+
+    // Grant group `catacomb` access to claim iio-sensor-proxy sensors (used for compass).
+    if (action.id == "net.hadess.SensorProxy.claim-sensor"
+        && subject.isInGroup("catacomb"))
+    {
+        return polkit.Result.YES;
+    }
 });

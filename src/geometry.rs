@@ -29,6 +29,21 @@ impl<T> Point<T> {
     }
 }
 
+impl Point<f32> {
+    /// Rotate a point around the origin.
+    #[must_use = "method returns a new point and does not mutate the original value"]
+    pub fn rotate(self, degrees: f32) -> Self {
+        let radians = degrees.to_radians();
+        let cos = radians.cos();
+        let sin = radians.sin();
+
+        let x = self.x * cos - self.y * sin;
+        let y = self.x * sin + self.y * cos;
+
+        Self::new(x, y)
+    }
+}
+
 impl<T> From<(T, T)> for Point<T> {
     fn from((x, y): (T, T)) -> Self {
         Self { x, y }

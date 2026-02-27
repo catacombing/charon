@@ -65,10 +65,10 @@ through `mmcli`:
 $ mmcli -m any --location-set-gps-refresh-rate 10
 ```
 
-To allow your user to read the location from the modem, you also need to grant
-it location permissions using polkit.
+To allow your user to access location and compass data, it is necessary to grant
+Charon Polkit permissions.
 
-The rule to grant these permissions to users in the `catacomb` group can be
+The rules to grant these permissions to users in the `catacomb` group can be
 found in the [rules](./rules) directory.
 
 ## Offline Tiles
