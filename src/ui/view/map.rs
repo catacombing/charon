@@ -88,6 +88,9 @@ const MIN_REROUTE_INTERVAL: Duration = Duration::from_secs(5);
 /// Default zoom level for displaying GPS location.
 const GPS_ZOOM: u8 = 18;
 
+/// Distance it takes to go from 1x to 2x zoom at scale 1.
+const DOUBLE_TAP_ZOOM_DISTANCE: f64 = 100.;
+
 /// Map rendering UI view.
 pub struct MapView {
     rendered_parent_tiles: HashSet<TileIndex>,
@@ -1188,7 +1191,7 @@ impl UiView for MapView {
 
         // Update the map position.
         match self.touch_state.action {
-            TouchAction::Tap | TouchAction::DoubleTap | TouchAction::Drag => {
+            TouchAction::Tap | TouchAction::Drag => {
                 // Ignore dragging until tap distance limit is exceeded.
                 let max_tap_distance = self.input_config.max_tap_distance;
                 let delta = slot.point - slot.start;
@@ -1203,6 +1206,23 @@ impl UiView for MapView {
 
                 // Ensure no long press fires after transitioning to drag.
                 self.touch_state.clear_long_press(&self.event_loop);
+            },
+            // Allow dragging up/down on double tap to zoom in/out.
+            TouchAction::DoubleTap => {
+                let zoom_distance = DOUBLE_TAP_ZOOM_DISTANCE * self.scale;
+
+                // Calculate double tap zoom factor.
+                let y_delta = slot.point.y - old_point.y;
+                let scale = if y_delta < 0. {
+                    (zoom_distance + y_delta.abs()) / zoom_distance
+                } else {
+                    zoom_distance / (zoom_distance + y_delta)
+                };
+
+                // Set zoom focus point to initial touch location.
+                self.touch_state.zoom_focus = slot.start;
+
+                self.zoom_by(scale);
             },
             TouchAction::Zoom => {
                 // Get opposing touch slot.
@@ -1253,11 +1273,6 @@ impl UiView for MapView {
         match self.touch_state.action {
             // On tap, snap zoom to nearest integer scale.
             TouchAction::Tap => self.snap_zoom(),
-            // Zoom in to next tile level on double-tap.
-            TouchAction::DoubleTap if self.cursor_tile.z < MAX_ZOOM => {
-                self.touch_state.zoom_focus = removed.point;
-                self.zoom_by(2.);
-            },
             // Handle route/search button press.
             TouchAction::Search if self.search_button.contains(removed.point) => {
                 let view = if self.route.is_some() { View::Route } else { View::Search };

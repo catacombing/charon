@@ -169,11 +169,10 @@ async fn gps_refresh_rate(proxies: &[LocationProxy<'_>]) -> Option<Interval> {
     let mut min_secs = None;
 
     // Find shortest refresh interval from all proxies.
-    let gps_nmea = ModemLocationSource::GpsNmea as u32;
-    let gps_raw = ModemLocationSource::GpsRaw as u32;
+    let sources = ModemLocationSource::GpsRaw as u32 | ModemLocationSource::GpsNmea as u32;
     for proxy in proxies {
         let enabled = proxy.enabled().await;
-        if enabled.is_ok_and(|enabled| enabled & gps_raw != 0 || enabled & gps_nmea != 0)
+        if enabled.is_ok_and(|enabled| enabled & sources != 0)
             && let Ok(refresh_rate) = proxy.gps_refresh_rate().await
             && min_secs.is_none_or(|min| min >= refresh_rate)
         {

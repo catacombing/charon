@@ -189,7 +189,7 @@ impl Default for Input {
             max_multi_tap: Duration::from_millis(300).into(),
             long_press: Duration::from_millis(750).into(),
             velocity_friction: 0.85,
-            max_tap_distance: 400.,
+            max_tap_distance: 800.,
             velocity_interval: 30,
         }
     }

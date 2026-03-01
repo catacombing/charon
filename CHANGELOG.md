@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - GPS compass heading using `iio-sensor-proxy`
 - NMEA modem GPS format support
 
+### Changed
+
+- Double tap now allows zooming in and out
+
 ## 1.5.0 - 2026-02-08
 
 ### Added

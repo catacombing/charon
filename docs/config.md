@@ -61,6 +61,6 @@ This section documents the `[input]` table.
 |-|-|-|-|
 |velocity_interval|Milliseconds per velocity tick|integer|`30`|
 |velocity_friction|Percentage of velocity retained each tick|float|`0.85`|
-|max_tap_distance|Square of the maximum distance before touch input is considered a drag|float|`400.0`|
+|max_tap_distance|Square of the maximum distance before touch input is considered a drag|float|`800.0`|
 |max_multi_tap|Maximum interval between taps to be considered a double/trible-tap|integer (milliseconds)|`300`|
 |long_press|Minimum time before a tap is considered a long-press|integer (milliseconds)|`750`|
