@@ -611,7 +611,7 @@ impl Regions {
         mut entry: Entry<R>,
     ) -> Result<Option<PathBuf>, Error> {
         // Ignore non-tile files.
-        if !entry.path_bytes().ends_with(b".gph.gz") {
+        if !entry.path_bytes().is_ok_and(|bytes| bytes.ends_with(b".gph.gz")) {
             return Ok(None);
         }
 

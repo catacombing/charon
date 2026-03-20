@@ -5,9 +5,11 @@ use std::ops::{Bound, Range, RangeBounds};
 use std::{cmp, mem};
 
 use calloop::LoopHandle;
+use skia_safe::gradient::Interpolation;
+use skia_safe::gradient_shader::{Gradient, GradientColors};
 use skia_safe::textlayout::{LineMetrics, Paragraph};
 use skia_safe::{
-    Canvas as SkiaCanvas, Color4f, Paint, Path, Point as SkiaPoint, Rect, Shader, TileMode,
+    Canvas as SkiaCanvas, Color4f, Paint, Path, Point as SkiaPoint, Rect, Shader, TileMode, shaders,
 };
 use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers};
 use tracing::{error, warn};
@@ -877,9 +879,11 @@ impl TextField {
 
         // Position color stops to match text padding areas.
         let padding_percentage = self.text_padding() / self.size.width;
-        let color_stops: &[f32] = &[0., padding_percentage, 1. - padding_percentage, 1.];
+        let color_stops = &[0., padding_percentage, 1. - padding_percentage, 1.];
 
-        Shader::linear_gradient(points, colors, color_stops, TileMode::Clamp, None, None)
+        let gradient_colors = GradientColors::new(colors, Some(color_stops), TileMode::Clamp, None);
+        let gradient = Gradient::new(gradient_colors, Interpolation::default());
+        shaders::linear_gradient(points, &gradient, None)
     }
 
     /// Get text's X offset.
