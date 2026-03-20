@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - Double tap now allows zooming in and out
+- Text selection carets now use the text foreground color
 
 ## 1.5.0 - 2026-02-08
 

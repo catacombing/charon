@@ -18,11 +18,12 @@ jobs:
             libboost-dev \
             libgtk-4-dev \
             libkyotocabinet-dev \
-            libmarisa-dev sqlite3 \
+            libmarisa-dev \
             libpango1.0-dev \
             libprotobuf-dev \
             libpulse-dev \
-            protobuf-compiler
+            protobuf-compiler \
+            sqlite3
       - uses: actions/checkout@v2
         with:
           submodules: 'recursive'

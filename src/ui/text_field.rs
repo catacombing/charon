@@ -1,6 +1,5 @@
 //! Text field input element.
 
-use std::f32::consts::SQRT_2;
 use std::io::Read;
 use std::ops::{Bound, Range, RangeBounds};
 use std::{cmp, mem};
@@ -30,9 +29,6 @@ const TEXT_PADDING: f32 = 15.;
 
 /// Selection caret size at scale 1.
 const CARET_SIZE: f64 = 5.;
-
-/// Caret outline width at scale 1.
-const CARET_STROKE: f64 = 3.;
 
 /// Single line text input field.
 pub struct TextField {
@@ -73,14 +69,11 @@ impl TextField {
         size: Size,
         font_scale: f32,
     ) -> Self {
-        let mut paint = Paint::default();
-        paint.set_stroke_width(CARET_STROKE as f32);
-
         Self {
             event_loop,
             font_scale,
-            paint,
             gradient_paint: Paint::default(),
+            paint: Paint::default(),
             text_input_dirty: true,
             point: point.into(),
             size: size.into(),
@@ -219,15 +212,8 @@ impl TextField {
                 let (end_points, _) = self.caret_points(point, end)?;
                 let end_path = Path::polygon(&end_points, true, None, true);
 
-                // Draw the caret outlines.
-                self.paint.set_stroke(true);
-                self.paint.set_color4f(Color4f::from(config.colors.highlight), None);
-                canvas.draw_path(&start_path, &self.paint);
-                canvas.draw_path(&end_path, &self.paint);
-
-                // Draw the center/background.
-                self.paint.set_stroke(false);
-                self.paint.set_color4f(Color4f::from(config.colors.background), None);
+                // Draw the carets.
+                self.paint.set_color4f(Color4f::from(config.colors.foreground), None);
                 canvas.draw_path(&start_path, &self.paint);
                 canvas.draw_path(&end_path, &self.paint);
 
@@ -299,8 +285,6 @@ impl TextField {
 
         self.scale = scale;
         self.dirty = true;
-
-        self.paint.set_stroke_width(self.stroke_size());
     }
 
     /// Check if a point lies within this text field.
@@ -710,12 +694,11 @@ impl TextField {
     where
         R: RangeBounds<usize>,
     {
-        let mut start = match range.start_bound() {
+        let start = match range.start_bound() {
             Bound::Included(start) => *start,
             Bound::Excluded(start) => *start + 1,
             Bound::Unbounded => usize::MIN,
         };
-        start = start.max(0);
         let mut end = match range.end_bound() {
             Bound::Included(end) => *end + 1,
             Bound::Excluded(end) => *end,
@@ -813,10 +796,7 @@ impl TextField {
         let caret_size = (CARET_SIZE * self.scale).round() as f32;
         let metrics = self.metrics_at(index)?;
 
-        // Calculate width of the triangle outline at the tip.
-        let stroke_point_width = SQRT_2 * self.stroke_size();
-
-        let y = metrics.baseline - metrics.ascent - stroke_point_width / 2.;
+        let y = metrics.baseline - metrics.ascent;
         let line_height = metrics.ascent + metrics.descent;
 
         let points = [
@@ -905,11 +885,6 @@ impl TextField {
     /// Get text's X offset.
     fn text_padding(&self) -> f32 {
         TEXT_PADDING * self.scale as f32 * self.font_scale
-    }
-
-    /// Get the current caret stroke size.
-    fn stroke_size(&self) -> f32 {
-        (CARET_STROKE * self.scale) as f32
     }
 }
 
