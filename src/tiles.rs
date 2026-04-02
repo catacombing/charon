@@ -449,6 +449,10 @@ impl LruCache {
 
     /// Load a tile from the cache.
     fn get(&mut self, index: &TileIndex) -> Option<&mut Tile> {
+        // Mark entry as most recently used.
+        self.lru.extract_if(|cached| cached == index).take(1).for_each(drop);
+        self.lru.push_front(*index);
+
         self.tiles.get_mut(index)
     }
 

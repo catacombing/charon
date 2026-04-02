@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+### Fixed
+
+- Tile LRU cache ignoring LRU
+
 ## 1.6.0 - 2026-03-20
 
 ### Added
