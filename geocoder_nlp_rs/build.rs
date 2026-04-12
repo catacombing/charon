@@ -99,7 +99,7 @@ fn main() {
     // Find and link dynamically against common geocoder-nlp dependencies.
     let kyotocabinet = PkgConfig::new().atleast_version("1.0.0").probe("kyotocabinet").unwrap();
     let sqlite3 = PkgConfig::new().atleast_version("3.0.0").probe("sqlite3").unwrap();
-    let marisa = PkgConfig::new().atleast_version("0.2.0").probe("marisa").unwrap();
+    let marisa = PkgConfig::new().atleast_version("0.3.1").probe("marisa").unwrap();
 
     // Collect include paths, so cxx_build can find them when cross-compiling.
     let mut include_paths = kyotocabinet.include_paths;
@@ -115,7 +115,7 @@ fn main() {
         .include("geocoder-nlp/thirdparty/sqlite3pp/headeronly_src/")
         .includes(include_paths)
         .include(out_dir)
-        .std("c++14")
+        .std("c++17")
         // Cross-compiling for aarch64 emits a lot of warnings,
         // so to avoid cluttering the build output we silence them.
         .warnings(false)

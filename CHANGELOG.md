@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 - Tile LRU cache ignoring LRU
+- Build with Marisa 0.3.1
 
 ## 1.6.0 - 2026-03-20
 
