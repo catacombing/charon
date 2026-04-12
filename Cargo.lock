@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "charon"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "astral-tokio-tar",
  "async-compression",
