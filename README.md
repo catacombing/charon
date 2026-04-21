@@ -33,6 +33,12 @@ The following features are **not** supported yet, but are on the roadmap:
 
  - Bulk tile download for offline rendering
 
+## Configuration
+
+See the [configuration file documentation].
+
+[configuration file documentation]: ./docs/config.md
+
 ## Building from Source
 
 Charon is compiled with cargo, which creates a binary at `target/release/charon`:
